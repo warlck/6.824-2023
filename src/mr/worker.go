@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"log"
 	"net/rpc"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -25,11 +26,10 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	for {
+		CallRequestJob()
+		time.Sleep(time.Second * time.Duration(1))
+	}
 }
 
 func CallRequestJob() {
@@ -39,9 +39,9 @@ func CallRequestJob() {
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		fmt.Printf("reply %v\n", reply)
+		debugf("reply %v\n", reply)
 	} else {
-		fmt.Printf("call failed!\n")
+		debugf("call failed!\n")
 	}
 
 }

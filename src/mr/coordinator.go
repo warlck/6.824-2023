@@ -60,7 +60,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 // RPC handler that workers use to request for a new task from the coordinator
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) {
-	reply.nReduce = c.nReduce
+	reply.NReduce = c.nReduce
 	taskType := MAP
 
 	c.mu.Lock()
@@ -71,11 +71,12 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	if taskType == MAP {
 		for filename, status := range c.mapJobsStatus {
 			if status == notStarted {
-				reply.fileName = filename
-				reply.task = MAP
+				reply.FileName = filename
+				reply.Task = MAP
 				c.mapJobsStatus[filename] = pending
 				// TODO: Start a 10 timer to check status of the job in 10 secs,
-				// Return the status of the task to noStarted if task is not completed in 10 sec
+				// Return the status of the task to notStarted if task is not completed in 10 sec
+				// this will make the map task available for to be scheduled with next worker
 				break
 			}
 		}

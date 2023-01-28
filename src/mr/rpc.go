@@ -30,11 +30,11 @@ type RequestTaskArgs struct {
 type RequestTaskReply struct {
 	// Type of the recevied job; can be MAP or REDUCE;
 	// defined as const in coordinator.go
-	task uint
+	Task uint
 
 	// Reply fields relevant for map jobs
-	fileName string
-	nReduce  int
+	FileName string
+	NReduce  int
 
 	// Reply fields relevant for reduce jobs
 	sequenceNumber int
