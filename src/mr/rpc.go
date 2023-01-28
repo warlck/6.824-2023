@@ -33,11 +33,12 @@ type RequestTaskReply struct {
 	Task uint
 
 	// Reply fields relevant for map jobs
-	FileName string
-	NReduce  int
+	FileName          string
+	NReduce           int
+	MapSequenceNumber int
 
 	// Reply fields relevant for reduce jobs
-	sequenceNumber int
+	SequenceNumber int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

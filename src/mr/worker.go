@@ -1,10 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/rpc"
+	"os"
 	"time"
 )
 
@@ -22,26 +27,101 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type WorkerState struct {
+	mapf    func(string, string) []KeyValue
+	reducef func(string, []string) string
+}
+
+// Processes the task that was assigned by coordinator
+// If the task type is MAP => runs mapf function on a fileName to obtain array of KeyValue types
+// and stores them in the MxN files there M represents number of M tasks, N represents number of reduce tasks
+// If the task type is REDUCE
+func (w *WorkerState) ProcessTask(task RequestTaskReply) {
+	if task.Task == MAP {
+		fileName := task.FileName
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", fileName)
+		}
+		content, err := io.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", fileName)
+		}
+		file.Close()
+		kva := w.mapf(fileName, string(content))
+		w.StoreKV(kva, task)
+
+	}
+
+}
+
+func (w *WorkerState) StoreKV(kva []KeyValue, task RequestTaskReply) {
+	fileRefs := make([]*os.File, task.NReduce)
+	encoders := make([]*json.Encoder, task.NReduce)
+
+	// Create temporary files for writing the output of mapf
+	for i := 0; i < task.NReduce; i++ {
+		tmpFile, err := ioutil.TempFile("", "")
+		if err != nil {
+			log.Fatal(err)
+		}
+		fileRefs[i] = tmpFile
+		encoders[i] = json.NewEncoder(tmpFile)
+	}
+
+	// Write the output of mapf to corresponding temporary file
+	for _, kv := range kva {
+		reduceN := ihash(kv.Key) % task.NReduce
+		enc := encoders[reduceN]
+		if err := enc.Encode(&kv); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	// Rename the tempfiles to correct "mr-x-y" format, and close the file refences
+	for i, _ := range fileRefs {
+		destFileName := fmt.Sprintf("mr-%d-%d", task.MapSequenceNumber, i)
+		os.Rename(fileRefs[i].Name(), destFileName)
+		err := fileRefs[i].Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+}
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
+	w := WorkerState{mapf: mapf, reducef: reducef}
+
 	for {
-		CallRequestJob()
+		task, err := CallRequestTask()
+		if err != nil {
+			break
+		}
+
+		if task.Task != WAIT {
+			w.ProcessTask(task)
+		}
 		time.Sleep(time.Second * time.Duration(1))
 	}
 }
 
-func CallRequestJob() {
+func CallRequestTask() (RequestTaskReply, error) {
 	args := RequestTaskArgs{}
 	reply := RequestTaskReply{}
 
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		debugf("reply %v\n", reply)
+		debugf("reply %+v\n", reply)
+		return reply, nil
+
 	} else {
 		debugf("call failed!\n")
+		return reply, errors.New("Faild RPC request")
 	}
 
 }

@@ -12,15 +12,16 @@ import (
 // Constant values defined to help with the implementation of mapreduce coordinator and workers
 const (
 	// The job (map or reduce) has not started yet
-	notStarted = 0
+	statusNotStarted = 0
 	// The job (map or reduce) has started and is currently being processed by worker
-	pending = 1
-	// The job (map or reduce) has been completed by the worker process
-	completed = 2
+	statusPending = 1
+	// The job (map or reduce) has been statusCompleted by the worker process
+	statusCompleted = 2
 
 	// These values are uused to  signal the worker if the job type is map or reduce
 	MAP    = 10
 	REDUCE = 20
+	WAIT   = 30
 )
 
 type Coordinator struct {
@@ -59,7 +60,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 // RPC handler that workers use to request for a new task from the coordinator
-func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) {
+func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
 	reply.NReduce = c.nReduce
 	taskType := MAP
 
@@ -69,20 +70,48 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	}
 
 	if taskType == MAP {
-		for filename, status := range c.mapJobsStatus {
-			if status == notStarted {
-				reply.FileName = filename
+		pendingCounter := 0
+		for i := 0; i < len(c.files); i++ {
+			fileName := c.files[i]
+			status := c.mapJobsStatus[fileName]
+
+			if status == statusNotStarted {
+				reply.FileName = fileName
 				reply.Task = MAP
-				c.mapJobsStatus[filename] = pending
+				reply.MapSequenceNumber = i
+				c.mapJobsStatus[fileName] = statusPending
 				// TODO: Start a 10 timer to check status of the job in 10 secs,
 				// Return the status of the task to notStarted if task is not completed in 10 sec
-				// this will make the map task available for to be scheduled with next worker
+				// this will make the  task available  to be scheduled with next worker
+				break
+			} else if status == statusPending {
+				// Counts the number of map tasks that are pending completion
+				// if pendinCounter = nFiles => all the map tasks are currently assigned
+				// and coordinator needs to wait for  map taks to finish
+				pendingCounter += 1
+				if pendingCounter == len(c.files) {
+					reply.Task = WAIT
+				}
+			}
+		}
+	}
+
+	if taskType == REDUCE {
+		for i, status := range c.reduceJobsStatus {
+			if status == statusNotStarted {
+				reply.Task = REDUCE
+				reply.SequenceNumber = i
+				c.reduceJobsStatus[i] = statusPending
+				// TODO: Start a 10 timer to check status of the job in 10 secs,
+				// Return the status of the task to notStarted if task is not completed in 10 sec
+				// this will make the  task available  to be scheduled with next worker
 				break
 			}
 		}
 	}
 	c.mu.Unlock()
-	debugf("c.mapsJobsStatus: %v\n ", c.mapJobsStatus)
+	debugf("c.mapsJobsStatus: %+v\n ", c.mapJobsStatus)
+	return nil
 }
 
 // start a thread that listens for RPCs from worker.go
@@ -127,7 +156,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	for _, file := range files {
-		c.mapJobsStatus[file] = notStarted
+		c.mapJobsStatus[file] = statusNotStarted
 	}
 
 	c.server()
