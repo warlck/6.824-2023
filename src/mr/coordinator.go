@@ -110,7 +110,6 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 		}
 	}
 	c.mu.Unlock()
-	debugf("c.mapsJobsStatus: %+v\n ", c.mapJobsStatus)
 	return nil
 }
 

@@ -10,6 +10,8 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"regexp"
+	"sort"
 	"time"
 )
 
@@ -53,6 +55,81 @@ func (w *WorkerState) ProcessTask(task RequestTaskReply) {
 		CallCompleteTask(task)
 	}
 
+	if task.TaskType == REDUCE {
+		kva := []KeyValue{}
+		filesToProcess := findFilesToProcess(task)
+		for _, fileName := range filesToProcess {
+			file, err := os.Open(fileName)
+			if err != nil {
+				log.Fatal(err)
+			}
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kva = append(kva, kv)
+			}
+		}
+
+		sort.Sort(ByKey(kva))
+
+		oname := fmt.Sprintf("mr-out-%d", task.ReduceSequenceNumber)
+		ofile, _ := os.Create(oname)
+
+		//
+		// call Reduce on each distinct key in kva[],
+		// and print the result to mr-out-ReduceSequenceNumber.
+		//
+		i := 0
+		for i < len(kva) {
+			j := i + 1
+			for j < len(kva) && kva[j].Key == kva[i].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, kva[k].Value)
+			}
+			output := w.reducef(kva[i].Key, values)
+
+			// this is the correct format for each line of Reduce output.
+			fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+			i = j
+		}
+
+		ofile.Close()
+		CallCompleteTask(task)
+	}
+
+}
+
+func findFilesToProcess(task RequestTaskReply) []string {
+	reduceN := task.ReduceSequenceNumber
+	files, err := ioutil.ReadDir("./")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pattern := fmt.Sprintf("mr-.*-%d", reduceN)
+	re, err := regexp.Compile(pattern)
+	fileNamesToProcess := []string{}
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		if re.MatchString(file.Name()) {
+			fileNamesToProcess = append(fileNamesToProcess, file.Name())
+		}
+	}
+
+	return fileNamesToProcess
 }
 
 func (w *WorkerState) StoreKV(kva []KeyValue, task RequestTaskReply) {
@@ -105,7 +182,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if task.TaskType != WAIT {
 			w.ProcessTask(task)
 		}
-		time.Sleep(time.Second * time.Duration(1))
+		time.Sleep(time.Second)
 	}
 }
 
