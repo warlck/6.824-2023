@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -22,8 +24,21 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type RequestTaskArgs struct {
+}
 
+type RequestTaskReply struct {
+	// Type of the recevied job; can be MAP or REDUCE;
+	// defined as const in coordinator.go
+	task uint
+
+	// Reply fields relevant for map jobs
+	fileName string
+	nReduce  int
+
+	// Reply fields relevant for reduce jobs
+	sequenceNumber int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
