@@ -37,7 +37,7 @@ type WorkerState struct {
 // and stores them in the MxN files there M represents number of M tasks, N represents number of reduce tasks
 // If the task type is REDUCE
 func (w *WorkerState) ProcessTask(task RequestTaskReply) {
-	if task.Task == MAP {
+	if task.TaskType == MAP {
 		fileName := task.FileName
 		file, err := os.Open(fileName)
 		if err != nil {
@@ -50,7 +50,7 @@ func (w *WorkerState) ProcessTask(task RequestTaskReply) {
 		file.Close()
 		kva := w.mapf(fileName, string(content))
 		w.StoreKV(kva, task)
-
+		CallCompleteTask(task)
 	}
 
 }
@@ -102,7 +102,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			break
 		}
 
-		if task.Task != WAIT {
+		if task.TaskType != WAIT {
 			w.ProcessTask(task)
 		}
 		time.Sleep(time.Second * time.Duration(1))
@@ -124,6 +124,24 @@ func CallRequestTask() (RequestTaskReply, error) {
 		return reply, errors.New("Faild RPC request")
 	}
 
+}
+
+func CallCompleteTask(task RequestTaskReply) {
+	args := CompleteTaskArgs{
+		TaskType:             task.TaskType,
+		MapSequenceNumber:    task.MapSequenceNumber,
+		ReduceSequenceNumber: task.ReduceSequenceNumber,
+	}
+	reply := CompleteTaskReply{}
+
+	ok := call("Coordinator.CompleteTask", &args, &reply)
+	if ok {
+		// reply.Y should be 100.
+		debugf("reply %+v\n", reply)
+
+	} else {
+		debugf("call failed!\n")
+	}
 }
 
 // example function to show how to make an RPC call to the coordinator.

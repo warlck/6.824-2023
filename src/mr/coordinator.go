@@ -77,7 +77,7 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 
 			if status == statusNotStarted {
 				reply.FileName = fileName
-				reply.Task = MAP
+				reply.TaskType = MAP
 				reply.MapSequenceNumber = i
 				c.mapJobsStatus[fileName] = statusPending
 				// TODO: Start a 10 timer to check status of the job in 10 secs,
@@ -90,7 +90,7 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 				// and coordinator needs to wait for  map taks to finish
 				pendingCounter += 1
 				if pendingCounter == len(c.files) {
-					reply.Task = WAIT
+					reply.TaskType = WAIT
 				}
 			}
 		}
@@ -99,8 +99,8 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	if taskType == REDUCE {
 		for i, status := range c.reduceJobsStatus {
 			if status == statusNotStarted {
-				reply.Task = REDUCE
-				reply.SequenceNumber = i
+				reply.TaskType = REDUCE
+				reply.ReduceSequenceNumber = i
 				c.reduceJobsStatus[i] = statusPending
 				// TODO: Start a 10 timer to check status of the job in 10 secs,
 				// Return the status of the task to notStarted if task is not completed in 10 sec
@@ -111,6 +111,21 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	}
 	c.mu.Unlock()
 	debugf("c.mapsJobsStatus: %+v\n ", c.mapJobsStatus)
+	return nil
+}
+
+func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) error {
+	c.mu.Lock()
+	if args.TaskType == MAP {
+		fileName := c.files[args.ReduceSequenceNumber]
+		c.mapJobsStatus[fileName] = statusCompleted
+		c.completedMapJobs += 1
+	} else if args.TaskType == REDUCE {
+		reduceN := args.ReduceSequenceNumber
+		c.reduceJobsStatus[reduceN] = statusCompleted
+		c.completedReduceJobs += 1
+	}
+	c.mu.Unlock()
 	return nil
 }
 
