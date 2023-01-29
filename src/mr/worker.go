@@ -179,10 +179,10 @@ func Worker(mapf func(string, string) []KeyValue,
 			break
 		}
 
-		if task.TaskType != WAIT {
-			w.ProcessTask(task)
+		if task.TaskType == WAIT {
+			time.Sleep(time.Second)
 		}
-		time.Sleep(time.Second)
+		w.ProcessTask(task)
 	}
 }
 
@@ -193,12 +193,10 @@ func CallRequestTask() (RequestTaskReply, error) {
 	ok := call("Coordinator.RequestTask", &args, &reply)
 	if ok {
 		// reply.Y should be 100.
-		debugf("reply %+v\n", reply)
 		return reply, nil
 
 	} else {
-		debugf("call failed!\n")
-		return reply, errors.New("Faild RPC request")
+		return reply, errors.New("Failed CallRequestTask RPC request")
 	}
 
 }
@@ -212,12 +210,8 @@ func CallCompleteTask(task RequestTaskReply) {
 	reply := CompleteTaskReply{}
 
 	ok := call("Coordinator.CompleteTask", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		debugf("reply %+v\n", reply)
-
-	} else {
-		debugf("call failed!\n")
+	if !ok {
+		log.Fatal("Failed CallCompleteTask RPC request")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 // Constant values defined to help with the implementation of mapreduce coordinator and workers
@@ -65,12 +66,11 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 	taskType := MAP
 
 	c.mu.Lock()
-	if c.completedMapJobs == c.nFiles {
+	if c.completedMapJobs == len(c.files) {
 		taskType = REDUCE
 	}
 
 	if taskType == MAP {
-		pendingCounter := 0
 		for i := 0; i < len(c.files); i++ {
 			fileName := c.files[i]
 			status := c.mapJobsStatus[fileName]
@@ -80,20 +80,19 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 				reply.TaskType = MAP
 				reply.MapSequenceNumber = i
 				c.mapJobsStatus[fileName] = statusPending
-				// TODO: Start a 10 timer to check status of the job in 10 secs,
+				// Start a 10 timer to check status of the job in 10 secs,
 				// Return the status of the task to notStarted if task is not completed in 10 sec
 				// this will make the  task available  to be scheduled with next worker
+				go c.checkStatusOfTask(MAP, i)
 				break
-			} else if status == statusPending {
-				// Counts the number of map tasks that are pending completion
-				// if pendinCounter = nFiles => all the map tasks are currently assigned
-				// and coordinator needs to wait for  map taks to finish
-				pendingCounter += 1
-				if pendingCounter == len(c.files) {
-					reply.TaskType = WAIT
-				}
 			}
 		}
+		// Check if MAP job has been assigned after traversing the mapJobsStatus
+		// If no job has been assigned => MAP tasks are pending completion, need to wait
+		if reply.TaskType != MAP {
+			reply.TaskType = WAIT
+		}
+
 	}
 
 	if taskType == REDUCE {
@@ -102,11 +101,18 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 				reply.TaskType = REDUCE
 				reply.ReduceSequenceNumber = i
 				c.reduceJobsStatus[i] = statusPending
-				// TODO: Start a 10 timer to check status of the job in 10 secs,
+				// Start a 10 seconds timer to check status of the job in 10 secs,
 				// Return the status of the task to notStarted if task is not completed in 10 sec
 				// this will make the  task available  to be scheduled with next worker
+				go c.checkStatusOfTask(REDUCE, i)
 				break
 			}
+		}
+
+		// Check if REDUCE teask has been assigned after traversing the reduceJobsStatus
+		// If no job has been assigned => REDUCE tasks are pending completion, need to wait
+		if reply.TaskType != REDUCE {
+			reply.TaskType = WAIT
 		}
 	}
 	c.mu.Unlock()
@@ -116,7 +122,7 @@ func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply
 func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskReply) error {
 	c.mu.Lock()
 	if args.TaskType == MAP {
-		fileName := c.files[args.ReduceSequenceNumber]
+		fileName := c.files[args.MapSequenceNumber]
 		c.mapJobsStatus[fileName] = statusCompleted
 		c.completedMapJobs += 1
 	} else if args.TaskType == REDUCE {
@@ -126,6 +132,23 @@ func (c *Coordinator) CompleteTask(args *CompleteTaskArgs, reply *CompleteTaskRe
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+func (c *Coordinator) checkStatusOfTask(taskType uint, sequenceNumber int) {
+	time.Sleep(time.Second * time.Duration(10))
+	c.mu.Lock()
+	if taskType == MAP {
+		fileName := c.files[sequenceNumber]
+		if c.mapJobsStatus[fileName] == statusPending {
+			c.mapJobsStatus[fileName] = statusNotStarted
+		}
+	} else if taskType == REDUCE {
+		if c.reduceJobsStatus[sequenceNumber] == statusPending {
+			c.reduceJobsStatus[sequenceNumber] = statusNotStarted
+		}
+	}
+	c.mu.Unlock()
+
 }
 
 // start a thread that listens for RPCs from worker.go
