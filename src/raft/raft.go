@@ -196,6 +196,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
 	rf.mu.Unlock()
 
 	reply.Term = currentTerm
@@ -208,8 +210,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.revertToFollowerState(args.Term)
 	}
 
+	candidateIsUpToDate := (args.LastLogTerm >= lastLogTerm) && (args.LastLogIndex >= lastLogIndex)
 	rf.mu.Lock()
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && candidateIsUpToDate {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
 		rf.electionTimerReset = time.Now()
