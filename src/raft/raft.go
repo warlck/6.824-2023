@@ -108,6 +108,11 @@ type Raft struct {
 	// for each server, index of highest log entry known to be replicated on server
 	// (initialized to 0, increases monotonically)
 	matchIndex []int
+
+	// Channel used to synchronize the applying of new entries when commitIndex is updated
+	commitCh chan int
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -196,8 +201,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	rf.mu.Unlock()
 
 	reply.Term = currentTerm
@@ -275,6 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	currentState := rf.currentState
+	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	rf.mu.Unlock()
 
 	reply.Term = currentTerm
@@ -285,7 +290,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	//
 	if currentTerm < args.Term || currentState == candidate {
 		rf.revertToFollowerState(args.Term)
 	}
@@ -293,6 +297,36 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Received valid AppendEntries from current leader, can reset the electiom timer
 	rf.mu.Lock()
 	rf.electionTimerReset = time.Now()
+	rf.mu.Unlock()
+
+	if lastLogIndex < args.PrevLogIndex || lastLogTerm != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	// Compare log entries of the follower and log entries in the arg.Entries to find the index of first conflicting entry
+	// (if any) int the follower log and in the args.Entries.
+	var i, j int
+	foundConflictEntry := false
+	rf.mu.Lock()
+	for i, j = args.PrevLogIndex+1, 0; i <= lastLogIndex || j < len(args.Entries); i, j = i+1, j+1 {
+		if rf.log[i].Term != args.Entries[j].Term {
+			foundConflictEntry = true
+			break
+		}
+	}
+
+	// Deletes the existing entry and all the follow it from the follower's log
+	// Appends any new entries not already in the log
+	if foundConflictEntry {
+		rf.log = append(rf.log[:i], args.Entries[j+1:]...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		min := min(args.LeaderCommit, len(rf.log)-1)
+		go rf.UpdateCommitIndex(min)
+	}
+
 	rf.mu.Unlock()
 
 }
@@ -393,12 +427,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-
+	rf.commitCh = make(chan int)
+	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.applyMessages()
 
 	return rf
 }
@@ -412,8 +448,7 @@ func (rf *Raft) StartElection() {
 
 	rf.electionTimerReset = time.Now()
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	requestVoteArgs := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateID:  rf.me,
@@ -569,4 +604,41 @@ func (rf *Raft) revertToFollowerState(newTerm int) {
 		rf.votedFor = -1
 	}
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) UpdateCommitIndex(newCommitIndex int) {
+	rf.mu.Lock()
+	rf.commitIndex = newCommitIndex
+	rf.mu.Unlock()
+
+	rf.commitCh <- newCommitIndex
+}
+
+func (rf *Raft) applyMessages() {
+	prevCommitIndex := 0
+	for newCommitIndex := range rf.commitCh {
+		if newCommitIndex > prevCommitIndex {
+			entiesToApply := make([]ApplyMsg, 1)
+			rf.mu.Lock()
+			for i := prevCommitIndex + 1; i <= newCommitIndex; i++ {
+				entiesToApply = append(entiesToApply, ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				})
+			}
+			rf.mu.Unlock()
+
+			for _, entry := range entiesToApply {
+				rf.applyCh <- entry
+			}
+		}
+	}
+}
+
+// *** Methods that assume the lock is aquired. ****
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
+	return lastLogIndex, lastLogTerm
 }
