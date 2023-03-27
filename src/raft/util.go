@@ -73,7 +73,7 @@ func Debug(topic logTopic, format string, a ...interface{}) {
 }
 
 func min(x, y int) int {
-	if x >= y {
+	if x <= y {
 		return x
 	}
 	return y

@@ -200,9 +200,10 @@ type RequestVoteReply struct {
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
-	rf.mu.Unlock()
+	// Debug(dVote, "S%d received Request Vote RPC args: %+v, currentTerm: %d, lastLogIndex: %d, lasLogTerm:%d", rf.me, args, currentTerm, lastLogIndex, lastLogTerm)
 
 	reply.Term = currentTerm
 	if currentTerm > args.Term {
@@ -214,8 +215,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.revertToFollowerState(args.Term)
 	}
 
-	candidateIsUpToDate := (args.LastLogTerm >= lastLogTerm) && (args.LastLogIndex >= lastLogIndex)
-	rf.mu.Lock()
+	candidateIsUpToDate := false
+	if args.LastLogTerm > lastLogTerm {
+		candidateIsUpToDate = true
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		candidateIsUpToDate = true
+	}
+
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && candidateIsUpToDate {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
@@ -223,7 +229,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
-	rf.mu.Unlock()
 
 }
 
@@ -277,16 +282,17 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	currentState := rf.currentState
-	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
-	rf.mu.Unlock()
+	lastLogIndex, _ := rf.lastLogIndexTerm()
 
 	reply.Term = currentTerm
-	// Debug(dInfo, "S%d, currentState = %d, received AppendEntries RPC from S%d, args = %+v", rf.me, currentState, args.LeaderId, args)
+	reply.Success = false
+
+	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, args = %+v", rf.me, args.LeaderId, args)
 
 	if currentTerm > args.Term {
-		reply.Success = false
 		return
 	}
 
@@ -295,45 +301,147 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// Received valid AppendEntries from current leader, can reset the electiom timer
-	rf.mu.Lock()
 	rf.electionTimerReset = time.Now()
-	rf.mu.Unlock()
 
-	if lastLogIndex < args.PrevLogIndex || lastLogTerm != args.PrevLogTerm {
-		reply.Success = false
+	// Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	if lastLogIndex < args.PrevLogIndex {
+		return
+	}
+
+	prevLogIndexEntry := rf.log[args.PrevLogIndex]
+	if prevLogIndexEntry.Term != args.PrevLogTerm {
 		return
 	}
 
 	// Compare log entries of the follower and log entries in the arg.Entries to find the index of first conflicting entry
 	// (if any) int the follower log and in the args.Entries.
 	var i, j int
-	foundConflictEntry := false
-	rf.mu.Lock()
-	for i, j = args.PrevLogIndex+1, 0; i <= lastLogIndex || j < len(args.Entries); i, j = i+1, j+1 {
+	foundConflict := false
+	for i, j = args.PrevLogIndex+1, 0; i <= lastLogIndex && j < len(args.Entries); i, j = i+1, j+1 {
 		if rf.log[i].Term != args.Entries[j].Term {
-			foundConflictEntry = true
+			// Found conflicting entry,
+			foundConflict = true
 			break
 		}
-	}
 
-	// Deletes the existing entry and all the follow it from the follower's log
-	// Appends any new entries not already in the log
-	if foundConflictEntry {
-		rf.log = append(rf.log[:i], args.Entries[j+1:]...)
 	}
+	// Debug(dInfo, "S%d has run loop foundConflict: %t, i:%d   j:%d,  lastLogIndex: %d, len(args.Entries): %d", rf.me, foundConflict, i, j, lastLogIndex, len(args.Entries))
+
+	// Delete the conflicting entry and all the follow it from the follower's log
+	// Appends any new entries not already in the log
+	if foundConflict {
+		rf.log = rf.log[:i]
+	}
+	rf.log = append(rf.log, args.Entries[j:]...)
+
+	reply.Success = true
+
+	Debug(dInfo, "S%d replying succes to AppendEntries RPC from S%d, args = %+v", rf.me, args.LeaderId, args)
 
 	if args.LeaderCommit > rf.commitIndex {
 		min := min(args.LeaderCommit, len(rf.log)-1)
-		go rf.UpdateCommitIndex(min)
+		rf.commitIndex = min
+		go rf.UpdatedCommitIndex(min)
 	}
+}
 
-	rf.mu.Unlock()
+// startArgreement -This method takes index of the latest log entry that we need to agree on and starts
+// agreement process on that new entry for each follolwer.
+// The method also passes the term of the latest log entry down to sendAppentries method as consistency check.
+// If during the process of agreeing on the element, the term of leader Raft server changes, we shall stop the
+// agreement  and return immediately.
+//
+// Following the Rules for Leaders section of Figure 2. of Raft paper, this method needs to correctly
+// identify which elements to send for each server, based on the according nextIndex[i] value.
+// If nextIndex[i] is smaller then or equal to newLogIndex, gets log entries starting at newLogIndex and ending with
+// newLogIndex and resets the newLogIndex to be nextIndex[i]. Calls AppendEntries RPC with updated values for the follower.
+// Otherwise, sends the element at newLogIndex.
+func (rf *Raft) startAgreement(newLogIndex int, newLogTerm int) {
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		entries := []LogEntry{}
+		// If last log index ≥ nextIndex for a follower: send
+		// AppendEntries RPC with log entries starting at nextIndex
+		rf.mu.Lock()
+		if rf.nextIndex[i] <= newLogIndex {
+			for i := rf.nextIndex[i]; i <= newLogIndex; i++ {
+				entries = append(entries, rf.log[i])
+			}
+			// Reset the index of first LogEntry element that is going to be sent if
+			// nextIndex[i] was actually smaller then newLogIndex.
+			// There is no change in nextIndex[i] == newLogIndex
+			newLogIndex = rf.nextIndex[i]
+		} else {
+			entries = append(entries, rf.log[newLogIndex])
+		}
+
+		rf.mu.Unlock()
+		Debug(dLeader, "S%d Starting Agreement with S%d for entries:%+v, at newlogIndex:%d", rf.me, i, entries, newLogIndex)
+		go rf.sendAppendEntries(i, entries, newLogIndex, newLogTerm)
+	}
 
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+// sendAppendEntries - Makes AppendEntries RPC to follower identified by `server` parameter.
+// This methods assumes that correct log entries (i.e entries that leader thinks are not yet copied to
+// follower) are passed as parameter, together with correct  index of first log entry that leader
+// believes to be in disagreement with the the follower's log.
+//
+// The `term` parameter is used for conistency check that ensures leader's term does not change
+// in the case of old RPC replies. If the term changes from the moment when we start agreeing on
+// log entries to moment when we receive reply to AppendEntries RPC, we stop the agreement and return.
+//
+// This method implements leader's functionality for agreement on log entries according to
+// specification defined in Rules for Leader's section of Figure 2. in Raft paper:
+// *******************************************************************************
+// If reply to AppendEntries RPC is successful: update nextIndex and matchIndex for follower -
+// Even though parallel executions of `sendAppendEntries` method can be happening with different
+// logEntries and newLogIndex values, the current execution can only make decision based
+// on the entries and newLogIndex that is passed as params to the method.
+// Hence we update as `matchIndex[i] = prevLogIndex + len(entries)`, where prevLogIndex
+// and entries are values that were passed to AppendEntries RPC call with successful reply.
+// *******************************************************************************
+// If AppendEntries fails (reply is not success) because of log inconsistency: decrement nextIndex and retry
+// In normal operation (without backtracking optimization), we shall set nextIndex[i] to prevLogIndex of failed
+// AppendEntries call and decrement prevLogIndex accordingly.
+func (rf *Raft) sendAppendEntries(server int, entries []LogEntry, newLogIndex int, term int) {
+	rf.mu.Lock()
+	// Debug(dLeader, "S%d log of the leader:  %v", rf.me, rf.log)
+	prevLogIndex := newLogIndex - 1
+	prevLogTerm := rf.log[prevLogIndex].Term
+
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+
+	for {
+		if len(args.Entries) > 0 {
+			Debug(dLeader, "S%d sending  AppenEntried to S%d, with args = %+v", rf.me, server, args)
+		}
+		reply := AppendEntriesReply{}
+		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		tryAgain := rf.processAppendEntriesReply(term, server, &args, &reply)
+		if !tryAgain {
+			return
+		}
+		time.Sleep(10 * time.Microsecond)
+	}
+
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -353,8 +461,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
+	rf.mu.Lock()
+	isLeader = rf.currentState == leader
 
+	if isLeader {
+		term = rf.currentTerm
+		rf.log = append(rf.log, LogEntry{Command: command, Term: term})
+		index = len(rf.log) - 1
+		go rf.startAgreement(index, term)
+	}
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -445,8 +561,9 @@ func (rf *Raft) StartElection() {
 	rf.currentState = candidate
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-
 	rf.electionTimerReset = time.Now()
+
+	// Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
 
 	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	requestVoteArgs := RequestVoteArgs{
@@ -496,19 +613,26 @@ func (rf *Raft) StartElection() {
 	}
 
 	for voteReceived := range votesChan {
-		//	Debug(dVote, "S%d  , received vote %+v, candidateTerm = %d", rf.me, voteReceived, requestVoteArgs.Term)
+		// Debug(dVote, "S%d  , received vote %+v, candidateTerm = %d", rf.me, voteReceived, requestVoteArgs.Term)
 		if !voteReceived.ok {
 			continue
 		}
 
+		rf.mu.Lock()
+		currentTerm := rf.currentTerm
+		rf.mu.Unlock()
+
 		// Convert to follower if received a RequestVoteReply with term number bigger then current term of Raft Server
 		// that is in candidate state
-		if voteReceived.Term > requestVoteArgs.Term {
+		if voteReceived.Term > currentTerm {
 			electionProgress.mu.Lock()
 			electionProgress.ended = true
 			electionProgress.mu.Unlock()
 
-			go rf.revertToFollowerState(voteReceived.Term)
+			rf.mu.Lock()
+			rf.revertToFollowerState(voteReceived.Term)
+			rf.mu.Unlock()
+
 			break
 		}
 
@@ -522,7 +646,7 @@ func (rf *Raft) StartElection() {
 			electionProgress.mu.Unlock()
 
 			// Debug(dVote, "S%d recevied enough votes = %d, starting becoming leader", rf.me, votes)
-			go rf.BecomeLeader(requestVoteArgs.Term)
+			rf.BecomeLeader(requestVoteArgs.Term)
 			break
 		}
 	}
@@ -532,15 +656,13 @@ func (rf *Raft) StartElection() {
 func (rf *Raft) BecomeLeader(candidateTerm int) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-
 	// Debug(dLeader, "S%d is becoming a leader; candidateTerm = %d, currentTerm = %d ", rf.me, candidateTerm, currentTerm)
 	// If Raft Server has moved to bigger term, it can not become leader in candidateTerm.
 	if currentTerm > candidateTerm {
+		rf.mu.Unlock()
 		return
 	}
 
-	rf.mu.Lock()
 	rf.currentState = leader
 
 	// Reinitiatilize volatile state of leaders
@@ -549,7 +671,6 @@ func (rf *Raft) BecomeLeader(candidateTerm int) {
 		rf.matchIndex[i] = 0
 	}
 	rf.mu.Unlock()
-
 	rf.sendHeartBeats(candidateTerm)
 
 }
@@ -557,21 +678,11 @@ func (rf *Raft) BecomeLeader(candidateTerm int) {
 func (rf *Raft) sendHeartBeats(candidateTerm int) {
 	for rf.killed() == false {
 		rf.mu.Lock()
-
-		prevLogIndex := len(rf.log) - 1
-		prevLogTerm := rf.log[prevLogIndex].Term
-
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			Entries:      []LogEntry{},
-			LeaderCommit: rf.commitIndex,
-		}
+		currentTerm := rf.currentTerm
+		lastLogIndex := len(rf.log)
 		rf.mu.Unlock()
 
-		if args.Term > candidateTerm {
+		if currentTerm > candidateTerm {
 			return
 		}
 
@@ -579,15 +690,10 @@ func (rf *Raft) sendHeartBeats(candidateTerm int) {
 			if i == rf.me {
 				continue
 			}
-
-			// Debug(dLeader, "S%d is sending heartbeat to S%d", rf.me, i)
+			// Debug(dLeader, "S%d is sending heartbeat to S%d, lastLogIndex = %d", rf.me, i, lastLogIndex)
 
 			go func(server int) {
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(server, &args, &reply)
-				if ok && reply.Term > args.Term {
-					rf.revertToFollowerState(reply.Term)
-				}
+				rf.sendAppendEntries(server, []LogEntry{}, lastLogIndex, candidateTerm)
 			}(i)
 		}
 
@@ -596,44 +702,73 @@ func (rf *Raft) sendHeartBeats(candidateTerm int) {
 
 }
 
-func (rf *Raft) revertToFollowerState(newTerm int) {
-	rf.mu.Lock()
-	if rf.currentTerm <= newTerm {
-		rf.currentState = follower
-		rf.currentTerm = newTerm
-		rf.votedFor = -1
-	}
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) UpdateCommitIndex(newCommitIndex int) {
-	rf.mu.Lock()
-	rf.commitIndex = newCommitIndex
-	rf.mu.Unlock()
-
+func (rf *Raft) UpdatedCommitIndex(newCommitIndex int) {
 	rf.commitCh <- newCommitIndex
 }
 
 func (rf *Raft) applyMessages() {
-	prevCommitIndex := 0
 	for newCommitIndex := range rf.commitCh {
-		if newCommitIndex > prevCommitIndex {
-			entiesToApply := make([]ApplyMsg, 1)
-			rf.mu.Lock()
-			for i := prevCommitIndex + 1; i <= newCommitIndex; i++ {
+		entiesToApply := make([]ApplyMsg, 0)
+		rf.mu.Lock()
+		lastApplied := rf.lastApplied
+		if newCommitIndex > lastApplied {
+			for i := lastApplied + 1; i <= newCommitIndex; i++ {
 				entiesToApply = append(entiesToApply, ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log[i].Command,
 					CommandIndex: i,
 				})
 			}
+			rf.lastApplied = newCommitIndex
 			rf.mu.Unlock()
 
 			for _, entry := range entiesToApply {
 				rf.applyCh <- entry
 			}
+		} else {
+			rf.mu.Unlock()
 		}
+
 	}
+}
+
+func (rf *Raft) processAppendEntriesReply(term int, server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	currentTerm := rf.currentTerm
+	Debug(dLeader, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
+
+	if currentTerm > term {
+		return false
+	}
+
+	if reply.Term > currentTerm {
+		rf.revertToFollowerState(reply.Term)
+		return false
+	}
+
+	//If successful: update nextIndex and matchIndex for follower
+	if reply.Success {
+		rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		rf.updatedMatchIndex(rf.matchIndex[server])
+		return false
+	}
+
+	//  AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+	{
+		newEntries := []LogEntry{}
+		newPrevLogIndex := args.PrevLogIndex - 1
+
+		newEntries = append(newEntries, rf.log[args.PrevLogIndex])
+		rf.nextIndex[server] = args.PrevLogIndex
+		args.PrevLogIndex = newPrevLogIndex
+		args.PrevLogTerm = rf.log[newPrevLogIndex].Term
+
+		newEntries = append(newEntries, args.Entries...)
+		args.Entries = newEntries
+	}
+	return true
 }
 
 // *** Methods that assume the lock is aquired. ****
@@ -641,4 +776,29 @@ func (rf *Raft) lastLogIndexTerm() (int, int) {
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
 	return lastLogIndex, lastLogTerm
+}
+
+func (rf *Raft) revertToFollowerState(newTerm int) {
+	if rf.currentTerm <= newTerm {
+		rf.currentState = follower
+		rf.currentTerm = newTerm
+		rf.votedFor = -1
+	}
+}
+
+func (rf *Raft) updatedMatchIndex(newMatchIndex int) {
+	counter := 1
+	for i, _ := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		if rf.matchIndex[i] >= newMatchIndex {
+			counter++
+		}
+	}
+
+	if counter > len(rf.peers)/2 && rf.log[newMatchIndex].Term == rf.currentTerm {
+		rf.commitIndex = newMatchIndex
+		go rf.UpdatedCommitIndex(newMatchIndex)
+	}
 }
