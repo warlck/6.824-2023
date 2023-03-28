@@ -20,12 +20,15 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -135,14 +138,14 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -150,19 +153,34 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logEntries []LogEntry
+	var votedFor int
+	var currentTerm int
+	var err error
+
+	// ***********************
+	// Order of decoding is important. Shall follow same order as
+	// persist function above
+	// ***********************
+	if err = d.Decode(&logEntries); err != nil {
+		log.Fatal("Failed to read log from persistent state", err)
+	}
+
+	if err = d.Decode(&votedFor); err != nil {
+		log.Fatal("Failed to read votedFor from persistent state", err)
+	}
+
+	if err = d.Decode(&currentTerm); err != nil {
+		log.Fatal("Failed to read currentTerm from persistent state", err)
+	}
+
+	rf.log = logEntries
+	rf.votedFor = votedFor
+	rf.currentTerm = currentTerm
+
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -228,6 +246,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
 		rf.electionTimerReset = time.Now()
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -319,11 +338,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Compare log entries of the follower and log entries in the arg.Entries to find the index of first conflicting entry
 	// (if any) int the follower log and in the args.Entries.
 	var i, j int
-	foundConflict := false
 	for i, j = args.PrevLogIndex+1, 0; i <= lastLogIndex && j < len(args.Entries); i, j = i+1, j+1 {
 		if rf.log[i].Term != args.Entries[j].Term {
-			// Found conflicting entry,
-			foundConflict = true
+			// Found conflicting entry, prune all following
+			// log entries starting with conflicting one.
+			rf.log = rf.log[:i]
 			break
 		}
 
@@ -332,10 +351,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Delete the conflicting entry and all the follow it from the follower's log
 	// Appends any new entries not already in the log
-	if foundConflict {
-		rf.log = rf.log[:i]
+	newEntries := args.Entries[j:]
+	rf.log = append(rf.log, newEntries...)
+	if len(newEntries) > 0 {
+		rf.persist()
 	}
-	rf.log = append(rf.log, args.Entries[j:]...)
 
 	reply.Success = true
 
@@ -469,6 +489,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		term = rf.currentTerm
 		rf.log = append(rf.log, LogEntry{Command: command, Term: term})
+		rf.persist()
 		index = len(rf.log) - 1
 		go rf.startAgreement(index, term)
 	}
@@ -564,6 +585,7 @@ func (rf *Raft) StartElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.electionTimerReset = time.Now()
+	rf.persist()
 
 	// Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
 
@@ -785,6 +807,7 @@ func (rf *Raft) revertToFollowerState(newTerm int) {
 		rf.currentState = follower
 		rf.currentTerm = newTerm
 		rf.votedFor = -1
+		rf.persist()
 	}
 }
 
