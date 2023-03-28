@@ -29,10 +29,12 @@ import (
 	"6.824/labrpc"
 )
 
+type state int
+
 const (
-	follower  = 1
-	leader    = 2
-	candidate = 3
+	follower  state = 1
+	leader    state = 2
+	candidate state = 3
 
 	hearbeatTimeout = time.Millisecond * 100
 	// Raft Paper Section 5.6 describes electionTimeout to be ~ 20-25x of broadcastTime.
@@ -84,7 +86,7 @@ type Raft struct {
 	votedFor    int // CandidateId that received vote in current term (or -1 if none)
 
 	// Current state at which Raft Server is operation. Can be Follower, Leader, Candidate
-	currentState int
+	currentState state
 
 	// timerReset - Stores the current time whenever valid RPC from a leader or candidate.
 	// Used by leader election function to check if current Raft server needs to start new election
@@ -497,7 +499,7 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	var resetTime time.Time
-	var currentState int
+	var currentState state
 
 	for rf.killed() == false {
 		// Sleep bettween 1.2s to 1.7s before checking if election needs to be restarted
