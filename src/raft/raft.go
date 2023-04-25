@@ -535,7 +535,7 @@ func (rf *Raft) ticker() {
 
 		if currentState != leader && time.Since(resetTime) > electionTimeout {
 			// Debug(dTimer, "S%d,  election timeout elapsed, starting election, currentState = %d", rf.me, currentState)
-			go rf.StartElection()
+			go rf.startElection()
 		}
 
 	}
@@ -578,17 +578,42 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-// StartElection -
-func (rf *Raft) StartElection() {
-	rf.mu.Lock()
-	rf.currentState = candidate
-	rf.currentTerm += 1
-	rf.votedFor = rf.me
-	rf.electionTimerReset = time.Now()
-	rf.persist()
+type electionState struct {
+	votes    int
+	finished bool
+	mu       sync.Mutex
+}
 
-	// Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
+func (rf *Raft) requestVote(peer int, args RequestVoteArgs, elections *electionState) {
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(peer, &args, &reply)
+	if ok {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
 
+		if reply.Term > rf.currentTerm {
+			rf.revertToFollowerState(reply.Term)
+			return
+		}
+
+		if reply.VoteGranted {
+			elections.mu.Lock()
+			elections.votes += 1
+			votes := elections.votes
+			elections.mu.Unlock()
+
+			if votes > len(rf.peers)/2 {
+				if rf.currentTerm == args.Term && rf.currentState == candidate {
+
+				}
+
+			}
+		}
+	}
+
+}
+
+func (rf *Raft) requestVotesL() {
 	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	requestVoteArgs := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -597,83 +622,30 @@ func (rf *Raft) StartElection() {
 		LastLogTerm:  lastLogTerm,
 	}
 
-	rf.mu.Unlock()
-
-	type voteResult struct {
-		ok   bool
-		from int
-		RequestVoteReply
-	}
-
-	type electionState struct {
-		ended bool
-		mu    sync.Mutex
-	}
-
-	votes := 1
-	votesChan := make(chan (voteResult))
-	electionProgress := electionState{}
+	elections := electionState{votes: 1}
 
 	for i, _ := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go func(server int, election *electionState) {
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(server, &requestVoteArgs, &reply)
-
-			// Checks if the vote result is still relevant. Returns from goroutine if not.
-			// This prevents the goroutine leakage. Without the check, for loop that reads from the
-			// votesChan would have ended, and this goroutine would have been blocked indefinitely.
-			election.mu.Lock()
-			if election.ended {
-				election.mu.Unlock()
-				return
-			}
-			election.mu.Unlock()
-
-			votesChan <- voteResult{ok, server, reply}
-		}(i, &electionProgress)
-	}
-
-	for voteReceived := range votesChan {
-		// Debug(dVote, "S%d  , received vote %+v, candidateTerm = %d", rf.me, voteReceived, requestVoteArgs.Term)
-		if !voteReceived.ok {
-			continue
-		}
-
-		rf.mu.Lock()
-		currentTerm := rf.currentTerm
-		rf.mu.Unlock()
-
-		// Convert to follower if received a RequestVoteReply with term number bigger then current term of Raft Server
-		// that is in candidate state
-		if voteReceived.Term > currentTerm {
-			electionProgress.mu.Lock()
-			electionProgress.ended = true
-			electionProgress.mu.Unlock()
-
-			rf.mu.Lock()
-			rf.revertToFollowerState(voteReceived.Term)
-			rf.mu.Unlock()
-
-			break
-		}
-
-		if voteReceived.VoteGranted {
-			votes += 1
-		}
-
-		if votes > len(rf.peers)/2 {
-			electionProgress.mu.Lock()
-			electionProgress.ended = true
-			electionProgress.mu.Unlock()
-
-			// Debug(dVote, "S%d recevied enough votes = %d, starting becoming leader", rf.me, votes)
-			rf.BecomeLeader(requestVoteArgs.Term)
-			break
+		if i != rf.me {
+			go rf.requestVote(i, requestVoteArgs, &elections)
 		}
 	}
+}
+
+// startElection -
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.currentState = candidate
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.electionTimerReset = time.Now()
+	rf.persist()
+
+	rf.requestVotesL()
+
+	// Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
+
 }
 
 // BecomeLeader -
