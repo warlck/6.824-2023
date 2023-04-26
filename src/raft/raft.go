@@ -123,7 +123,6 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	rf.mu.Lock()
@@ -522,7 +521,7 @@ func (rf *Raft) ticker() {
 	var resetTime time.Time
 	var currentState state
 
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Sleep bettween 1.2s to 1.7s before checking if election needs to be restarted
 		randSleepTimer := (12 + rand.Float64()*6) * float64(hearbeatTimeout)
 		// Debug(dTimer, "S%d,  sleeping random millseconds = %d", rf.me, time.Duration(randSleepTimer).Milliseconds())
@@ -601,12 +600,10 @@ func (rf *Raft) requestVote(peer int, args RequestVoteArgs, elections *electionS
 			elections.votes += 1
 			votes := elections.votes
 			elections.mu.Unlock()
-
 			if votes > len(rf.peers)/2 {
 				if rf.currentTerm == args.Term && rf.currentState == candidate {
-
+					rf.BecomeLeaderL(args.Term)
 				}
-
 			}
 		}
 	}
@@ -649,16 +646,7 @@ func (rf *Raft) startElection() {
 }
 
 // BecomeLeader -
-func (rf *Raft) BecomeLeader(candidateTerm int) {
-	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	// Debug(dLeader, "S%d is becoming a leader; candidateTerm = %d, currentTerm = %d ", rf.me, candidateTerm, currentTerm)
-	// If Raft Server has moved to bigger term, it can not become leader in candidateTerm.
-	if currentTerm > candidateTerm {
-		rf.mu.Unlock()
-		return
-	}
-
+func (rf *Raft) BecomeLeaderL(candidateTerm int) {
 	rf.currentState = leader
 
 	// Reinitiatilize volatile state of leaders
@@ -666,13 +654,11 @@ func (rf *Raft) BecomeLeader(candidateTerm int) {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 	}
-	rf.mu.Unlock()
-	rf.sendHeartBeats(candidateTerm)
-
+	go rf.sendHeartBeats(candidateTerm)
 }
 
 func (rf *Raft) sendHeartBeats(candidateTerm int) {
-	for rf.killed() == false {
+	for !rf.killed() {
 		rf.mu.Lock()
 		currentTerm := rf.currentTerm
 		lastLogIndex := len(rf.log)
