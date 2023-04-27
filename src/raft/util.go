@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strconv"
 	"time"
@@ -77,4 +78,15 @@ func min(x, y int) int {
 		return x
 	}
 	return y
+}
+
+func max(x, y int) int {
+	if x >= y {
+		return x
+	}
+	return y
+}
+
+func newElectionTimeout() time.Duration {
+	return time.Duration((12 + rand.Float64()*6) * float64(hearbeatTimeout))
 }

@@ -22,7 +22,6 @@ import (
 
 	"bytes"
 	"log"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -44,7 +43,7 @@ const (
 	// Due to characteristic of the testing system: Max 10 heartbeats per second and
 	// Leader election is required to happen within 5 seconds ;
 	// the heartbeatTimeout and electionTimeout parameters are chosen to suit the testing setup.
-	electionTimeout = 15 * hearbeatTimeout // 1.5s
+
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -95,6 +94,7 @@ type Raft struct {
 	// Used by leader election function to check if current Raft server needs to start new election
 	electionTimerReset time.Time
 
+	electionTimeout time.Duration
 	// Raft Server's log of logEntries.
 	// Each log entry has a command for state machine that is received from client and term when entry was received
 	// by leader (first index is 1)
@@ -298,6 +298,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // currentTerm, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XTerm   int  // Term number of the conflicting entry
+	XIndex  int  // Index of the first log entry with conflicting term
+	XLen    int  // Length  of the follower's log
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -309,6 +312,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = currentTerm
 	reply.Success = false
+	reply.XIndex = -1
+	reply.XTerm = -1
+	reply.XLen = -1
 
 	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, args = %+v", rf.me, args.LeaderId, args)
 
@@ -326,11 +332,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if lastLogIndex < args.PrevLogIndex {
+		reply.XLen = len(rf.log)
 		return
 	}
 
 	prevLogIndexEntry := rf.log[args.PrevLogIndex]
 	if prevLogIndexEntry.Term != args.PrevLogTerm {
+		reply.XTerm = prevLogIndexEntry.Term
+		reply.XIndex = args.PrevLogIndex
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.log[i].Term != reply.XTerm {
+				reply.XIndex = i + 1
+				break
+			}
+		}
 		return
 	}
 
@@ -383,25 +398,7 @@ func (rf *Raft) startAgreement(newLogIndex int, newLogTerm int) {
 		if i == rf.me {
 			continue
 		}
-		entries := []LogEntry{}
-		// If last log index ≥ nextIndex for a follower: send
-		// AppendEntries RPC with log entries starting at nextIndex
-		rf.mu.Lock()
-		if rf.nextIndex[i] <= newLogIndex {
-			for i := rf.nextIndex[i]; i <= newLogIndex; i++ {
-				entries = append(entries, rf.log[i])
-			}
-			// Reset the index of first LogEntry element that is going to be sent if
-			// nextIndex[i] was actually smaller then newLogIndex.
-			// There is no change in nextIndex[i] == newLogIndex
-			newLogIndex = rf.nextIndex[i]
-		} else {
-			entries = append(entries, rf.log[newLogIndex])
-		}
-
-		rf.mu.Unlock()
-		Debug(dLeader, "S%d Starting Agreement with S%d for entries:%+v, at newlogIndex:%d", rf.me, i, entries, newLogIndex)
-		go rf.sendAppendEntries(i, entries, newLogIndex, newLogTerm)
+		go rf.sendAppendEntries(i)
 	}
 
 }
@@ -428,14 +425,26 @@ func (rf *Raft) startAgreement(newLogIndex int, newLogTerm int) {
 // If AppendEntries fails (reply is not success) because of log inconsistency: decrement nextIndex and retry
 // In normal operation (without backtracking optimization), we shall set nextIndex[i] to prevLogIndex of failed
 // AppendEntries call and decrement prevLogIndex accordingly.
-func (rf *Raft) sendAppendEntries(server int, entries []LogEntry, newLogIndex int, term int) {
+func (rf *Raft) sendAppendEntries(server int) {
 	rf.mu.Lock()
 	// Debug(dLeader, "S%d log of the leader:  %v", rf.me, rf.log)
-	prevLogIndex := newLogIndex - 1
+
+	if rf.currentState != leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	prevLogIndex := rf.nextIndex[server] - 1
+	if prevLogIndex >= len(rf.log) {
+		prevLogIndex = len(rf.log) - 1
+	}
 	prevLogTerm := rf.log[prevLogIndex].Term
 
+	entries := make([]LogEntry, len(rf.log[prevLogIndex+1:]))
+	copy(entries, rf.log[prevLogIndex+1:])
+
 	args := AppendEntriesArgs{
-		Term:         term,
+		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
@@ -444,23 +453,14 @@ func (rf *Raft) sendAppendEntries(server int, entries []LogEntry, newLogIndex in
 	}
 	rf.mu.Unlock()
 
-	for {
-		if len(args.Entries) > 0 {
-			Debug(dLeader, "S%d sending  AppenEntried to S%d, with args = %+v", rf.me, server, args)
-		}
-		reply := AppendEntriesReply{}
-		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+	if len(args.Entries) > 0 {
+		Debug(dLeader, "S%d sending  AppenEntried to S%d, with args = %+v", rf.me, server, args)
+	}
+	reply := AppendEntriesReply{}
+	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
-		if !ok {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		tryAgain := rf.processAppendEntriesReply(term, server, &args, &reply)
-		if !tryAgain {
-			return
-		}
-		time.Sleep(10 * time.Microsecond)
+	if ok {
+		rf.processAppendEntriesReply(server, &args, &reply)
 	}
 
 }
@@ -520,16 +520,16 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	var resetTime time.Time
 	var currentState state
+	var electionTimeout time.Duration
 
 	for !rf.killed() {
-		// Sleep bettween 1.2s to 1.7s before checking if election needs to be restarted
-		randSleepTimer := (12 + rand.Float64()*6) * float64(hearbeatTimeout)
+
 		// Debug(dTimer, "S%d,  sleeping random millseconds = %d", rf.me, time.Duration(randSleepTimer).Milliseconds())
-		time.Sleep(time.Duration(randSleepTimer))
 
 		rf.mu.Lock()
 		resetTime = rf.electionTimerReset
 		currentState = rf.currentState
+		electionTimeout = rf.electionTimeout
 		rf.mu.Unlock()
 
 		if currentState != leader && time.Since(resetTime) > electionTimeout {
@@ -537,6 +537,17 @@ func (rf *Raft) ticker() {
 			go rf.startElection()
 		}
 
+		if currentState == leader {
+			for i, _ := range rf.peers {
+				if i != rf.me {
+					go func(server int) {
+						rf.sendAppendEntries(server)
+					}(i)
+				}
+				// Debug(dLeader, "S%d is sending heartbeat to S%d, lastLogIndex = %d", rf.me, i, lastLogIndex)
+			}
+		}
+		time.Sleep(hearbeatTimeout)
 	}
 }
 
@@ -558,6 +569,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.votedFor = -1
 	rf.currentState = follower
+	rf.electionTimeout = newElectionTimeout()
 
 	// Initilize Raft Server log with sigle, empty logEntry. This ensures that  index of the first
 	// logEntry with client commands starts at 1.
@@ -637,6 +649,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	rf.electionTimerReset = time.Now()
+	rf.electionTimeout = newElectionTimeout()
 	rf.persist()
 
 	rf.requestVotesL()
@@ -654,14 +667,14 @@ func (rf *Raft) BecomeLeaderL(candidateTerm int) {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 	}
-	go rf.sendHeartBeats(candidateTerm)
+	//go rf.sendHeartBeats(candidateTerm)
 }
 
 func (rf *Raft) sendHeartBeats(candidateTerm int) {
 	for !rf.killed() {
 		rf.mu.Lock()
 		currentTerm := rf.currentTerm
-		lastLogIndex := len(rf.log)
+
 		rf.mu.Unlock()
 
 		if currentTerm > candidateTerm {
@@ -675,7 +688,7 @@ func (rf *Raft) sendHeartBeats(candidateTerm int) {
 			// Debug(dLeader, "S%d is sending heartbeat to S%d, lastLogIndex = %d", rf.me, i, lastLogIndex)
 
 			go func(server int) {
-				rf.sendAppendEntries(server, []LogEntry{}, lastLogIndex, candidateTerm)
+				rf.sendAppendEntries(server)
 			}(i)
 		}
 
@@ -714,15 +727,11 @@ func (rf *Raft) applyMessages() {
 	}
 }
 
-func (rf *Raft) processAppendEntriesReply(term int, server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) processAppendEntriesReply(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
 	Debug(dLeader, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
-
-	if currentTerm > term {
-		return false
-	}
 
 	if reply.Term > currentTerm {
 		rf.revertToFollowerState(reply.Term)
@@ -735,20 +744,34 @@ func (rf *Raft) processAppendEntriesReply(term int, server int, args *AppendEntr
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		rf.updatedMatchIndex(rf.matchIndex[server])
 		return false
-	}
-
+	} else
 	//  AppendEntries fails because of log inconsistency: decrement nextIndex and retry
 	{
-		newEntries := []LogEntry{}
-		newPrevLogIndex := args.PrevLogIndex - 1
 
-		newEntries = append(newEntries, rf.log[args.PrevLogIndex])
-		rf.nextIndex[server] = args.PrevLogIndex
-		args.PrevLogIndex = newPrevLogIndex
-		args.PrevLogTerm = rf.log[newPrevLogIndex].Term
+		newNextIndex := max(1, rf.nextIndex[server]-1)
+		if reply.XLen > 0 {
+			newNextIndex = reply.XLen
+		} else if reply.XTerm > 0 {
+			var i int
+			foundXTerm := false
 
-		newEntries = append(newEntries, args.Entries...)
-		args.Entries = newEntries
+			for i = args.PrevLogIndex; i >= 0; i-- {
+				if rf.log[i].Term == reply.XTerm {
+					foundXTerm = true
+				}
+
+				if rf.log[i].Term < reply.XTerm {
+					break
+				}
+			}
+
+			if !foundXTerm {
+				newNextIndex = reply.XIndex
+			} else {
+				newNextIndex = i + 1
+			}
+		}
+		rf.nextIndex[server] = newNextIndex
 	}
 	return true
 }
