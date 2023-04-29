@@ -97,8 +97,10 @@ type Raft struct {
 	electionTimeout time.Duration
 	// Raft Server's log of logEntries.
 	// Each log entry has a command for state machine that is received from client and term when entry was received
-	// by leader (first index is 1)
+	// by leader
 	log raftLog
+
+	snapshot snapshot
 
 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	commitIndex int
@@ -137,18 +139,25 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Example:
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	e.Encode(rf.snapshot.LastIncludedIndex)
+	e.Encode(rf.snapshot.LastIncludedTerm)
+	state := w.Bytes()
+
+	if len(rf.snapshot.Data) > 0 {
+		rf.persister.SaveStateAndSnapshot(state, rf.snapshot.Data)
+	} else {
+		rf.persister.SaveStateAndSnapshot(state, nil)
+	}
+
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -158,6 +167,8 @@ func (rf *Raft) readPersist(data []byte) {
 	var logEntries raftLog
 	var votedFor int
 	var currentTerm int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var err error
 
 	// ***********************
@@ -176,9 +187,25 @@ func (rf *Raft) readPersist(data []byte) {
 		log.Fatal("Failed to read currentTerm from persistent state", err)
 	}
 
+	if err = d.Decode(&lastIncludedIndex); err != nil {
+		log.Fatal("Failed to read lastIncludedIndex from persistent state", err)
+	}
+
+	if err = d.Decode(&lastIncludedTerm); err != nil {
+		log.Fatal("Failed to read lastIncludedTerm from persistent state", err)
+	}
+
 	rf.log = logEntries
 	rf.votedFor = votedFor
 	rf.currentTerm = currentTerm
+	rf.snapshot.LastIncludedIndex = lastIncludedIndex
+	rf.snapshot.LastIncludedTerm = lastIncludedTerm
+	rf.snapshot.Data = snapshot
+
+	if len(snapshot) > 0 {
+		rf.commitIndex = rf.snapshot.LastIncludedIndex
+		rf.lastApplied = rf.snapshot.LastIncludedIndex
+	}
 
 }
 
@@ -196,8 +223,22 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	rf.mu.Lock()
+	rf.mu.Unlock()
 
+	// Ignore if snapshot is older than or same as current snapshot
+	if index <= rf.snapshot.LastIncludedIndex {
+		return
+	}
+
+	rf.snapshot.Data = snapshot
+	rf.snapshot.LastIncludedIndex = index
+	rf.snapshot.LastIncludedTerm = rf.log.entryAtIndex(index).Term
+	rf.lastApplied = index
+	rf.commitIndex = index
+	rf.log.truncateLogPrefix(index)
+
+	rf.persist()
 }
 
 // RequestVote RPC arguments structure.
@@ -442,8 +483,8 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 	prevLogTerm := rf.log.entryAtIndex(prevLogIndex).Term
 
-	entries := make([]LogEntry, len(rf.log.Log[prevLogIndex+1:]))
-	copy(entries, rf.log.Log[prevLogIndex+1:])
+	entries := make([]LogEntry, len(rf.log.Log[rf.log.logArrayIndex(prevLogIndex)+1:]))
+	copy(entries, rf.log.Log[rf.log.logArrayIndex(prevLogIndex)+1:])
 
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -583,7 +624,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitCh = make(chan int)
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -807,4 +848,13 @@ func (rf *Raft) updatedMatchIndexL(newMatchIndex int) {
 		rf.commitIndex = newMatchIndex
 		go rf.UpdatedCommitIndex(newMatchIndex)
 	}
+}
+
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	if rf.log.len() == 0 {
+		return rf.snapshot.LastIncludedIndex, rf.snapshot.LastIncludedTerm
+	}
+	lastLogIndex := rf.log.lastLogIndex()
+	lastLogTerm := rf.log.entryAtIndex(lastLogIndex).Term
+	return lastLogIndex, lastLogTerm
 }

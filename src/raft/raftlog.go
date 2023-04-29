@@ -16,6 +16,10 @@ type raftLog struct {
 // 	return lastLogIndex, lastLogTerm
 // }
 
+func (rl *raftLog) len() int {
+	return len(rl.Log) + rl.FirstEntryIndex
+}
+
 func (rl *raftLog) lastLogIndex() int {
 	return rl.len() - 1
 }
@@ -33,11 +37,17 @@ func (rl *raftLog) entryAtIndex(index int) LogEntry {
 	return rl.Log[rl.logArrayIndex(index)]
 }
 
-// Trancates all log entries starting with index provided in params
+// Truncates all log entries starting with index provided in params
 func (rl *raftLog) truncateLogSuffix(index int) {
 	rl.Log = rl.Log[:rl.logArrayIndex(index)]
 }
 
-func (rl *raftLog) len() int {
-	return len(rl.Log) + rl.FirstEntryIndex
+// Truncates all log entries from the start of the log, up to provided index (index included).
+// This method is used during snapshotting
+func (rl *raftLog) truncateLogPrefix(index int) {
+	truncated := rl.Log[index+1:]
+	newLog := make([]LogEntry, len(truncated))
+	copy(newLog, truncated)
+	rl.Log = newLog
+	rl.FirstEntryIndex = index + 1
 }
