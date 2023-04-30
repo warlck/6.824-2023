@@ -157,7 +157,7 @@ func (rf *Raft) persist() {
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte, snapshot []byte) {
+func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -200,12 +200,9 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	rf.currentTerm = currentTerm
 	rf.snapshot.LastIncludedIndex = lastIncludedIndex
 	rf.snapshot.LastIncludedTerm = lastIncludedTerm
-	rf.snapshot.Data = snapshot
 
-	if len(snapshot) > 0 {
-		rf.commitIndex = rf.snapshot.LastIncludedIndex
-		rf.lastApplied = rf.snapshot.LastIncludedIndex
-	}
+	rf.commitIndex = rf.snapshot.LastIncludedIndex
+	rf.lastApplied = rf.snapshot.LastIncludedIndex
 
 }
 
@@ -226,6 +223,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	rf.mu.Unlock()
 
+	Debug(dSnap, "S%d received snapshot RPC, index=%d, lastIncludedIndex=%d", rf.me, index, rf.snapshot.LastIncludedIndex)
 	// Ignore if snapshot is older than or same as current snapshot
 	if index <= rf.snapshot.LastIncludedIndex {
 		return
@@ -234,8 +232,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.snapshot.Data = snapshot
 	rf.snapshot.LastIncludedIndex = index
 	rf.snapshot.LastIncludedTerm = rf.log.entryAtIndex(index).Term
-	rf.lastApplied = index
-	rf.commitIndex = index
 	rf.log.truncateLogPrefix(index)
 
 	rf.persist()
@@ -483,8 +479,8 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 	prevLogTerm := rf.log.entryAtIndex(prevLogIndex).Term
 
-	entries := make([]LogEntry, len(rf.log.Log[rf.log.logArrayIndex(prevLogIndex)+1:]))
-	copy(entries, rf.log.Log[rf.log.logArrayIndex(prevLogIndex)+1:])
+	entries := make([]LogEntry, len(rf.log.suffix(prevLogIndex)))
+	copy(entries, rf.log.suffix(prevLogIndex))
 
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -624,7 +620,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitCh = make(chan int)
 	rf.applyCh = applyCh
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
+	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

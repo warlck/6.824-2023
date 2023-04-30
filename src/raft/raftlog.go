@@ -45,9 +45,15 @@ func (rl *raftLog) truncateLogSuffix(index int) {
 // Truncates all log entries from the start of the log, up to provided index (index included).
 // This method is used during snapshotting
 func (rl *raftLog) truncateLogPrefix(index int) {
-	truncated := rl.Log[index+1:]
-	newLog := make([]LogEntry, len(truncated))
-	copy(newLog, truncated)
+	suffix := rl.suffix(index)
+	newLog := make([]LogEntry, len(suffix))
+	copy(newLog, suffix)
 	rl.Log = newLog
 	rl.FirstEntryIndex = index + 1
+}
+
+// Returns log of entries starting at `index + 1`.
+// Equvivalent to slice [index + 1:] operation
+func (rl *raftLog) suffix(index int) []LogEntry {
+	return rl.Log[rl.logArrayIndex(index)+1:]
 }
