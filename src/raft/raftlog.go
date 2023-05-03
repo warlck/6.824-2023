@@ -33,11 +33,26 @@ func (rl *raftLog) entryAtIndex(index int) LogEntry {
 	return rl.Log[rl.logArrayIndex(index)]
 }
 
-// Trancates all log entries starting with index provided in params
+// Truncates all log entries starting with index provided in params
 func (rl *raftLog) truncateLogSuffix(index int) {
 	rl.Log = rl.Log[:rl.logArrayIndex(index)]
 }
 
+// Truncates all the log entries from beginning up to and including index
+// Creates new log array to enable GC to reclaim memory of truncated items
+// Resets the firstEntryIndex of the log to start on `index+1`
+func (rl *raftLog) truncatePrefix(index int) {
+	truncated := rl.Log[rl.logArrayIndex(index)+1:]
+	newLog := make([]LogEntry, len(truncated))
+	copy(newLog, truncated)
+	rl.Log = newLog
+	rl.FirstEntryIndex = index + 1
+}
+
 func (rl *raftLog) len() int {
 	return len(rl.Log) + rl.FirstEntryIndex
+}
+
+func (rl *raftLog) logSuffix(index int) []LogEntry {
+	return rl.Log[rl.logArrayIndex(index):]
 }

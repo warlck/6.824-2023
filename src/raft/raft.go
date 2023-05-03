@@ -100,6 +100,9 @@ type Raft struct {
 	// by leader (first index is 1)
 	log raftLog
 
+	// Stores the Raft server's snapshot and its metadata
+	snap snapShot
+
 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	commitIndex int
 	// index of highest log entry applied to state machine (initialized to 0, increase	monotonically)
@@ -143,8 +146,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.currentTerm)
+	e.Encode(rf.snap.lastIncludedIndex)
+	e.Encode(rf.snap.lastIncludedTerm)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.snap.data)
 }
 
 // restore previously persisted state.
@@ -158,6 +163,8 @@ func (rf *Raft) readPersist(data []byte) {
 	var logEntries raftLog
 	var votedFor int
 	var currentTerm int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var err error
 
 	// ***********************
@@ -176,10 +183,19 @@ func (rf *Raft) readPersist(data []byte) {
 		log.Fatal("Failed to read currentTerm from persistent state", err)
 	}
 
+	if err = d.Decode(&lastIncludedIndex); err != nil {
+		log.Fatal("Failed to read lastIncludedIndex from persistent state", err)
+	}
+
+	if err = d.Decode(&lastIncludedTerm); err != nil {
+		log.Fatal("Failed to read lastIncludedTerm from persistent state", err)
+	}
+
 	rf.log = logEntries
 	rf.votedFor = votedFor
 	rf.currentTerm = currentTerm
-
+	rf.snap.lastIncludedIndex = lastIncludedIndex
+	rf.snap.lastIncludedTerm = lastIncludedTerm
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -196,7 +212,17 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.snap.data = snapshot
+	rf.snap.lastIncludedIndex = index
+	rf.snap.lastIncludedTerm = rf.log.entryAtIndex(index).Term
+
+	rf.log.truncatePrefix(index)
+	rf.persist()
+
+	Debug(dSnap, "S%d received and updated Snapshot at index: %d,   RAFT: %+v", rf.me, index, rf)
 
 }
 
@@ -340,14 +366,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// can there be a case when leader's prevlogindex is trying to read into log index that is already
 	// in  snapshot of the follower beyond the index of last log entry that is saved as part of shanpshot?
 	// In correct operation, it shall not happen as entries in shapshot are committed. Leader sending args.Prevlogindex
-	// imply that we are going to prune all the conflicting elements following the args.PrevLogIndex
+	// imply that we are going to prune all the conflicting elements following the args.PrevLogIndex if we have match
+	// In case we receive preLogIndex that is smaller the rf.snapshot.lastIncludedIndex, we will just reject
+	// AppendEntries RPC
+	prevLogTerm := rf.logTerm(args.PrevLogIndex)
+	if prevLogTerm == -1 {
+		return
+	}
 
-	prevLogIndexEntry := rf.log.entryAtIndex(args.PrevLogIndex)
-	if prevLogIndexEntry.Term != args.PrevLogTerm {
-		reply.XTerm = prevLogIndexEntry.Term
+	if prevLogTerm != args.PrevLogTerm {
+		reply.XTerm = prevLogTerm
 		reply.XIndex = args.PrevLogIndex
 		for i := args.PrevLogIndex - 1; i >= rf.log.FirstEntryIndex; i-- {
-			if rf.log.entryAtIndex(i).Term != reply.XTerm {
+			if rf.logTerm(i) != reply.XTerm {
 				reply.XIndex = i + 1
 				break
 			}
@@ -375,7 +406,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	Debug(dInfo, "S%d replying succes to AppendEntries RPC from S%d, args = %+v, log = %+v", rf.me, args.LeaderId, args, rf.log.Log)
+	Debug(dWarn, "S%d replying succes to AppendEntries RPC from S%d, args = %+v, log = %+v", rf.me, args.LeaderId, args, rf.log.Log)
 
 	if args.LeaderCommit > rf.commitIndex {
 		min := min(args.LeaderCommit, rf.log.lastLogIndex())
@@ -440,10 +471,14 @@ func (rf *Raft) sendAppendEntries(server int) {
 	if prevLogIndex >= rf.log.len() {
 		prevLogIndex = rf.log.lastLogIndex()
 	}
-	prevLogTerm := rf.log.entryAtIndex(prevLogIndex).Term
+	prevLogTerm := rf.logTerm(prevLogIndex)
+	// PrevlogIndex is less then snapshots lastIncludedIndex, need to send the snapshot
+	if prevLogTerm == -1 {
+		rf.sendInstallSnapshot(server)
+	}
 
-	entries := make([]LogEntry, len(rf.log.Log[prevLogIndex+1:]))
-	copy(entries, rf.log.Log[prevLogIndex+1:])
+	entries := make([]LogEntry, len(rf.log.logSuffix(prevLogIndex+1)))
+	copy(entries, rf.log.logSuffix(prevLogIndex+1))
 
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -703,7 +738,6 @@ func (rf *Raft) sendHeartBeats(candidateTerm int) {
 }
 
 func (rf *Raft) UpdatedCommitIndex(newCommitIndex int) {
-	Debug(dLog, "S%d updating commit index to %d", rf.me, newCommitIndex)
 	rf.commitCh <- newCommitIndex
 }
 
@@ -713,6 +747,7 @@ func (rf *Raft) applyMessages() {
 		rf.mu.Lock()
 		lastApplied := rf.lastApplied
 		if newCommitIndex > lastApplied {
+			Debug(dCommit, "S%d updating commit index to %d", rf.me, newCommitIndex)
 			for i := lastApplied + 1; i <= newCommitIndex; i++ {
 				entiesToApply = append(entiesToApply, ApplyMsg{
 					CommandValid: true,
@@ -737,7 +772,7 @@ func (rf *Raft) processAppendEntriesReply(server int, args *AppendEntriesArgs, r
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
-	Debug(dLeader, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
+	Debug(dTest, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
 
 	if reply.Term > currentTerm {
 		rf.revertToFollowerStateL(reply.Term)
@@ -803,8 +838,17 @@ func (rf *Raft) updatedMatchIndexL(newMatchIndex int) {
 		}
 	}
 
-	if counter > len(rf.peers)/2 && rf.log.entryAtIndex(newMatchIndex).Term == rf.currentTerm {
+	if counter > len(rf.peers)/2 && rf.logTerm(newMatchIndex) == rf.currentTerm {
 		rf.commitIndex = newMatchIndex
 		go rf.UpdatedCommitIndex(newMatchIndex)
 	}
+}
+
+func (rf *Raft) logTerm(index int) int {
+	if index < rf.snap.lastIncludedIndex {
+		return -1
+	} else if index == rf.snap.lastIncludedIndex {
+		return rf.snap.lastIncludedTerm
+	}
+	return rf.log.entryAtIndex(index).Term
 }
