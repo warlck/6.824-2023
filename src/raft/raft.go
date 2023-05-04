@@ -196,6 +196,10 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.snap.lastIncludedIndex = lastIncludedIndex
 	rf.snap.lastIncludedTerm = lastIncludedTerm
+
+	if lastIncludedIndex > 0 {
+		rf.lastApplied = lastIncludedIndex
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -474,7 +478,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 	prevLogTerm := rf.logTerm(prevLogIndex)
 	// PrevlogIndex is less then snapshots lastIncludedIndex, need to send the snapshot
 	if prevLogTerm == -1 {
+		rf.mu.Unlock()
 		rf.sendInstallSnapshot(server)
+		return
 	}
 
 	entries := make([]LogEntry, len(rf.log.logSuffix(prevLogIndex+1)))
@@ -612,6 +618,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Initilize Raft Server log with sigle, empty logEntry. This ensures that  index of the first
 	// logEntry with client commands starts at 1.
 	rf.log = raftLog{Log: []LogEntry{{}}}
+	rf.snap.data = nil
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -772,7 +779,7 @@ func (rf *Raft) processAppendEntriesReply(server int, args *AppendEntriesArgs, r
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
-	Debug(dTest, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
+	Debug(dError, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
 
 	if reply.Term > currentTerm {
 		rf.revertToFollowerStateL(reply.Term)
@@ -851,4 +858,83 @@ func (rf *Raft) logTerm(index int) int {
 		return rf.snap.lastIncludedTerm
 	}
 	return rf.log.entryAtIndex(index).Term
+}
+
+type IntallSnapshotRequest struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type IntallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int) {
+	rf.mu.Lock()
+	args := IntallSnapshotRequest{
+		Term:              rf.currentTerm,
+		LeaderID:          rf.me,
+		LastIncludedIndex: rf.snap.lastIncludedIndex,
+		LastIncludedTerm:  rf.snap.lastIncludedTerm,
+		Data:              rf.snap.data,
+		Done:              true,
+	}
+	rf.mu.Unlock()
+	reply := IntallSnapshotReply{}
+	for {
+		Debug(dSnap, "S%d sending InstallSnapshot to S%d args = %+v", rf.me, server, args)
+
+		ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
+		if ok {
+			rf.mu.Lock()
+			if rf.nextIndex[server] <= args.LastIncludedIndex {
+				rf.nextIndex[server] = args.LastIncludedIndex + 1
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.revertToFollowerStateL(reply.Term)
+			}
+			rf.mu.Unlock()
+			break
+		}
+	}
+}
+
+func (rf *Raft) InstallSnapshot(args *IntallSnapshotRequest, reply *IntallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Debug(dSnap, "S%d received InstallSnapshot args = %+v", rf.me, args)
+
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		return
+	}
+
+	if rf.snap.lastIncludedIndex < args.LastIncludedIndex {
+		rf.snap.lastIncludedIndex = args.LastIncludedIndex
+		rf.snap.lastIncludedTerm = args.LastIncludedTerm
+		rf.snap.data = args.Data
+		rf.log.truncatePrefix(args.LastIncludedIndex)
+
+		if rf.lastApplied < args.LastIncludedIndex {
+			rf.lastApplied = args.LastIncludedIndex
+		}
+	}
+	go rf.applySnapshot(args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
+}
+
+func (rf *Raft) applySnapshot(snapshot []byte, snapshotIndex, snapshotTerm int) {
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  snapshotTerm,
+		SnapshotIndex: snapshotIndex,
+	}
+	rf.applyCh <- msg
 }
