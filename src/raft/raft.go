@@ -199,6 +199,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	if lastIncludedIndex > 0 {
 		rf.lastApplied = lastIncludedIndex
+		rf.commitIndex = lastIncludedIndex
 	}
 }
 
@@ -497,7 +498,7 @@ func (rf *Raft) sendAppendEntries(server int) {
 	rf.mu.Unlock()
 
 	if len(args.Entries) > 0 {
-		Debug(dLeader, "S%d sending  AppenEntried to S%d, with args = %+v", rf.me, server, args)
+		Debug(dLeader, "S%d sending  AppenEntried to S%d, with args = %+v, log: %+v", rf.me, server, args, rf.log)
 	}
 	reply := AppendEntriesReply{}
 	ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
@@ -534,6 +535,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log.Log = append(rf.log.Log, LogEntry{Command: command, Term: term})
 		rf.persist()
 		index = rf.log.lastLogIndex()
+		Debug(dLeader, "S%d is starting agreemtn on index: %d, term: %d, command: %v", rf.me, index, term, command)
 		go rf.startAgreement(index, term)
 	}
 
@@ -919,12 +921,21 @@ func (rf *Raft) InstallSnapshot(args *IntallSnapshotRequest, reply *IntallSnapsh
 		rf.snap.lastIncludedIndex = args.LastIncludedIndex
 		rf.snap.lastIncludedTerm = args.LastIncludedTerm
 		rf.snap.data = args.Data
-		rf.log.truncatePrefix(args.LastIncludedIndex)
+		if args.LastIncludedIndex >= rf.log.lastLogIndex() {
+			rf.log.truncatePrefix(rf.log.lastLogIndex())
+			rf.log.FirstEntryIndex = args.LastIncludedIndex + 1
+		} else {
+			rf.log.truncatePrefix(args.LastIncludedIndex)
+		}
 
 		if rf.lastApplied < args.LastIncludedIndex {
 			rf.lastApplied = args.LastIncludedIndex
 		}
+		if rf.commitIndex < args.LastIncludedIndex {
+			rf.commitIndex = args.LastIncludedIndex
+		}
 	}
+	rf.persist()
 	go rf.applySnapshot(args.Data, args.LastIncludedIndex, args.LastIncludedTerm)
 }
 
