@@ -103,6 +103,9 @@ type Raft struct {
 	// Stores the Raft server's snapshot and its metadata
 	snap snapShot
 
+	// Signals if new snapshot was received that is pending to be applied to state machine
+	newSnapshotInstalled bool
+
 	// index of highest log entry known to be committed (initialized to 0, increases monotonically)
 	commitIndex int
 	// index of highest log entry applied to state machine (initialized to 0, increase	monotonically)
@@ -730,6 +733,20 @@ func (rf *Raft) applyMessages() {
 		entiesToApply := make([]ApplyMsg, 0)
 		rf.mu.Lock()
 		lastApplied := rf.lastApplied
+		if rf.newSnapshotInstalled {
+			rf.newSnapshotInstalled = false
+			msg := ApplyMsg{
+				CommandValid:  false,
+				SnapshotValid: true,
+				Snapshot:      rf.snap.data,
+				SnapshotTerm:  rf.snap.lastIncludedTerm,
+				SnapshotIndex: rf.snap.lastIncludedIndex,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			rf.mu.Lock()
+		}
+
 		if newCommitIndex > lastApplied {
 			Debug(dCommit, "S%d updating last applied index to %d", rf.me, newCommitIndex)
 			for i := lastApplied + 1; i <= newCommitIndex; i++ {
@@ -918,20 +935,14 @@ func (rf *Raft) InstallSnapshot(args *IntallSnapshotRequest, reply *IntallSnapsh
 		rf.log.truncatePrefix(args.LastIncludedIndex)
 	}
 
-	if rf.lastApplied < args.LastIncludedIndex {
-		rf.lastApplied = args.LastIncludedIndex
-	}
+	rf.lastApplied = args.LastIncludedIndex
+
 	if rf.commitIndex < args.LastIncludedIndex {
 		rf.commitIndex = args.LastIncludedIndex
 	}
 
+	rf.newSnapshotInstalled = true
 	rf.persist()
-	msg := ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
-	}
-	rf.applyCh <- msg
+	go rf.UpdatedCommitIndex(args.LastIncludedIndex)
+
 }
