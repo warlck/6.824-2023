@@ -222,6 +222,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if index < rf.snap.lastIncludedIndex {
+		return
+	}
+
 	rf.snap.data = snapshot
 	rf.snap.lastIncludedTerm = rf.logTerm(index)
 	rf.snap.lastIncludedIndex = index
