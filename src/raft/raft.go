@@ -143,7 +143,6 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
-	// Example:
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
@@ -203,13 +202,13 @@ func (rf *Raft) readPersist(data []byte) {
 	if lastIncludedIndex > 0 {
 		rf.lastApplied = lastIncludedIndex
 		rf.commitIndex = lastIncludedIndex
+		rf.snap.data = rf.persister.ReadSnapshot()
 	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
 
 	return true
@@ -224,8 +223,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 
 	rf.snap.data = snapshot
+	rf.snap.lastIncludedTerm = rf.logTerm(index)
 	rf.snap.lastIncludedIndex = index
-	rf.snap.lastIncludedTerm = rf.log.entryAtIndex(index).Term
 
 	rf.log.truncatePrefix(index)
 	rf.persist()
@@ -534,6 +533,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	isLeader = rf.currentState == leader
+	Debug(dLeader, "S%d received agreement request command: %v", rf.me, command)
 
 	if isLeader {
 		term = rf.currentTerm
@@ -593,9 +593,11 @@ func (rf *Raft) ticker() {
 				if i != rf.me {
 					go func(server int) {
 						rf.sendAppendEntries(server)
+						Debug(dLeader, "S%d is sending heartbeat to S%d", rf.me, server)
 					}(i)
+
 				}
-				Debug(dLeader, "S%d is sending heartbeat to S%d", rf.me, i)
+
 			}
 		}
 		time.Sleep(hearbeatTimeout)
@@ -730,21 +732,23 @@ func (rf *Raft) UpdatedCommitIndex(newCommitIndex int) {
 
 func (rf *Raft) applyMessages() {
 	for newCommitIndex := range rf.commitCh {
+
+		if rf.killed() {
+			return
+		}
+		var msg ApplyMsg
 		entiesToApply := make([]ApplyMsg, 0)
 		rf.mu.Lock()
 		lastApplied := rf.lastApplied
 		if rf.newSnapshotInstalled {
 			rf.newSnapshotInstalled = false
-			msg := ApplyMsg{
+			msg = ApplyMsg{
 				CommandValid:  false,
 				SnapshotValid: true,
 				Snapshot:      rf.snap.data,
 				SnapshotTerm:  rf.snap.lastIncludedTerm,
 				SnapshotIndex: rf.snap.lastIncludedIndex,
 			}
-			rf.mu.Unlock()
-			rf.applyCh <- msg
-			rf.mu.Lock()
 		}
 
 		if newCommitIndex > lastApplied {
@@ -757,14 +761,14 @@ func (rf *Raft) applyMessages() {
 				})
 			}
 			rf.lastApplied = newCommitIndex
-			rf.mu.Unlock()
-
-			for _, entry := range entiesToApply {
-				rf.applyCh <- entry
-				Debug(dCommit, "S%d applied entry: %+v", rf.me, entry)
-			}
-		} else {
-			rf.mu.Unlock()
+		}
+		rf.mu.Unlock()
+		if msg.SnapshotValid {
+			rf.applyCh <- msg
+		}
+		for _, entry := range entiesToApply {
+			rf.applyCh <- entry
+			Debug(dCommit, "S%d applied entry: %+v", rf.me, entry)
 		}
 
 	}
