@@ -500,9 +500,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 
 	go func() {
-		if len(args.Entries) > 0 {
-			Debug(dLeader, "S%d sending  AppenEntries to S%d, with args = %+v, log: %+v", rf.me, server, args, rf.log)
-		}
+//		if len(args.Entries) > 0 {
+//			Debug(dLeader, "S%d sending  AppenEntries to S%d, with args = %+v, log: %+v", rf.me, server, args, rf.log)
+//		}
 		reply := AppendEntriesReply{}
 		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
