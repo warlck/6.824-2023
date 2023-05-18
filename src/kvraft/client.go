@@ -1,9 +1,12 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"strconv"
 
+	"6.824/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
@@ -24,7 +27,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
@@ -35,14 +37,38 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) Get(key string) string {
+
+	args := GetArgs{
+		Key:         key,
+		RequestUUID: strconv.FormatInt(nrand(), 10),
+	}
+
+	reply := GetReply{}
+	var i int
+	for i = 0; i < len(ck.servers); i++ {
+		ok := false
+		for !ok {
+			ok = ck.servers[i].Call("KVServer.Get", &args, &reply)
+		}
+		if reply.Err == OK {
+			return reply.Value
+		} else {
+			// For now Get request tries another server from the list
+			// TODO: Build optimization that will receive a LeaderID on ErrWrongLeader
+			// will make quuery to Leader
+
+			// If client has already looped through all the servers and did not find the Leader, nned to try again
+			if i == len(ck.servers)-1 {
+				i = 0
+			}
+		}
+	}
 
 	// You will have to modify this function.
 	return ""
 }
 
-//
 // shared by Put and Append.
 //
 // you can send an RPC with code like this:
@@ -51,9 +77,35 @@ func (ck *Clerk) Get(key string) string {
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:         key,
+		Value:       value,
+		Op:          op,
+		RequestUUID: strconv.FormatInt(nrand(), 10),
+	}
+
+	reply := PutAppendReply{}
+
+	var i int
+	for i = 0; i < len(ck.servers); i++ {
+		ok := false
+		for !ok {
+			ok = ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		}
+		if reply.Err == OK {
+			return
+		} else {
+			// For now Get request tries another server from the list
+			// TODO: Build optimization that will receive a LeaderID on ErrWrongLeader
+			// will make quuery to Leader
+
+			// If client has already looped through all the servers and did not find the Leader, nned to try again
+			if i == len(ck.servers)-1 {
+				i = 0
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -40,11 +40,50 @@ type KVServer struct {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	command := Op{
+		Key:         args.Key,
+		Op:          "Get",
+		RequestUUID: args.RequestUUID,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	Debug(dClient, "S%d received Get  Request %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
+	// We need to check if ApplyMsg receiver has  already received an apply message with current index
+	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
+	// buffer of 1. We can read the value in the buffered channel and return to client
+	responseWaiter, ok := kv.opResponseWaiters[index]
+
+	// If apply message with current index has not been processsed yet, create a channel that we use to wait
+	// for  Raft processing to complete.
+	if !ok {
+		responseWaiter = make(chan OpResponse, 1)
+		kv.opResponseWaiters[index] = responseWaiter
+	}
+	reply.Value = kv.stateMachine[args.Key]
+	kv.mu.Unlock()
+
+	opResponse := <-responseWaiter
+	// Clear the channel from the Server's reponsewaiters
+	go kv.removeResponseWaiter(index)
+	// If the command that Raft applied, matches the command that this RPC handlder has submitted
+	// (i.e RequestUUID and index matches)
+	// the request has been sucessfully commited to stateMachine.
+	// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
+	if opResponse.index == index && opResponse.RequestUUID == args.RequestUUID {
+		reply.Err = OK
+	} else {
+		reply.Value = ""
+		reply.Err = ErrWrongLeader
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-
 	command := Op{
 		Key:         args.Key,
 		Value:       args.Value,
@@ -59,6 +98,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
+	Debug(dClient, "S%d received PutAppend | after lock ", kv.me)
 	// We need to check if ApplyMsg receiver has  already received an apply message with current index
 	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
 	// buffer of 1. We can read the value in the buffered channel and return to client
@@ -67,12 +107,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// If apply message with current index has not been processsed yet, create a channel that we use to wait
 	// for  Raft processing to complete.
 	if !ok {
-		responseWaiter = make(chan OpResponse)
+		responseWaiter = make(chan OpResponse, 1)
 		kv.opResponseWaiters[index] = responseWaiter
 	}
 	kv.mu.Unlock()
 
 	opResponse := <-responseWaiter
+	// Clear the channel from the reponsewaiters map
+	go kv.removeResponseWaiter(index)
 	// If the command that Raft applied, matches the command that this RPC handlder has submitted
 	// (i.e RequestUUID and index matches)
 	// the request has been sucessfully commited to stateMachine.
@@ -82,6 +124,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	} else {
 		reply.Err = ErrWrongLeader
 	}
+
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -142,7 +185,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) receiveApplyMessages() {
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock()
-
+		Debug(dCommit, "S%d received message %+v, SM: %+v", kv.me, applyMsg, kv.stateMachine)
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
@@ -155,9 +198,8 @@ func (kv *KVServer) receiveApplyMessages() {
 				// RPC handler has created a channel that it is waiting on before replying to client request
 				if ok {
 					// Wakes up the RPC handler that is waiting on this channel.
-					go func() {
-						reponseWaiter <- reponse
-					}()
+					// This is safe, as the channel needs to be buffered.
+					reponseWaiter <- reponse
 				} else {
 					// If RPC handler was late to create a channel,  create a buffered channel
 					// for RPC handler to eventually read and reply to client
@@ -165,9 +207,9 @@ func (kv *KVServer) receiveApplyMessages() {
 					bufferedWaiter <- reponse
 					kv.opResponseWaiters[applyMsg.CommandIndex] = bufferedWaiter
 				}
-
 			}
 		}
+		Debug(dCommit, "S%d applied message SM:%+v, WaitersMap: %+v", kv.me, kv.stateMachine, kv.opResponseWaiters)
 
 		kv.mu.Unlock()
 	}
@@ -181,9 +223,17 @@ func (kv *KVServer) applyOpToStateMachineL(op Op) {
 	if op.Op == "Append" {
 		value, ok := kv.stateMachine[op.Key]
 		if ok {
-			kv.stateMachine[op.Key] = fmt.Sprintf("%s  %s", value, op.Value)
+			kv.stateMachine[op.Key] = fmt.Sprintf("%s%s", value, op.Value)
 		} else {
 			kv.stateMachine[op.Key] = op.Value
 		}
 	}
+}
+
+// Clears the response waiter channel that was used to by RPC KVServer's RPC handlers
+func (kv *KVServer) removeResponseWaiter(index int) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	delete(kv.opResponseWaiters, index)
 }
