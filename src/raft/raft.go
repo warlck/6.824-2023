@@ -500,9 +500,9 @@ func (rf *Raft) sendAppendEntries(server int) {
 	}
 
 	go func() {
-//		if len(args.Entries) > 0 {
-//			Debug(dLeader, "S%d sending  AppenEntries to S%d, with args = %+v, log: %+v", rf.me, server, args, rf.log)
-//		}
+		//		if len(args.Entries) > 0 {
+		//			Debug(dLeader, "S%d sending  AppenEntries to S%d, with args = %+v, log: %+v", rf.me, server, args, rf.log)
+		//		}
 		reply := AppendEntriesReply{}
 		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
 
@@ -533,7 +533,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	isLeader = rf.currentState == leader
-	Debug(dLeader, "S%d received agreement request command: %v", rf.me, command)
+	//Debug(dLeader, "S%d received agreement request command: %v", rf.me, command)
 
 	if isLeader {
 		term = rf.currentTerm
@@ -710,14 +710,14 @@ func (rf *Raft) startElection() {
 
 	rf.requestVotesL()
 
-	// Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
+	Debug(dLog2, "S%d is starting an election ; candidateTerm = %d ", rf.me, rf.currentTerm)
 
 }
 
 // BecomeLeader -
 func (rf *Raft) BecomeLeaderL(candidateTerm int) {
 	rf.currentState = leader
-
+	Debug(dLeader, "S%d became leader at term = %d ", rf.me, candidateTerm)
 	// Reinitiatilize volatile state of leaders
 	for i, _ := range rf.peers {
 		rf.nextIndex[i] = rf.log.len()
@@ -778,7 +778,7 @@ func (rf *Raft) processAppendEntriesReply(server int, args *AppendEntriesArgs, r
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
-	Debug(dError, "S%d received reply  from S%d reply = %+v with args = %+v", rf.me, server, reply, args)
+	Debug(dError, "S%d received reply  from S%d reply = %+v with args = %+v, amILeader = %t", rf.me, server, reply, args, rf.currentState == leader)
 
 	if reply.Term > currentTerm {
 		rf.revertToFollowerStateL(reply.Term)

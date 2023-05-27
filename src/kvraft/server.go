@@ -11,20 +11,17 @@ import (
 )
 
 type Op struct {
-	Key         string
-	Value       string
-	Op          string
-	RequestUUID string
-}
-
-type OpResponseWaiter struct {
-	waiterCh    chan OpResponse
-	RequestUUID string
+	Key          string
+	Value        string
+	Op           string
+	RequestSeqID int64
+	ClientID     int64
 }
 
 type OpResponse struct {
-	RequestUUID string
-	index       int
+	requestSeqID int64
+	index        int
+	clientID     int64
 }
 
 type KVServer struct {
@@ -34,26 +31,34 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	maxraftstate      int // snapshot if log grows this big
-	stateMachine      map[string]string
+	maxraftstate int // snapshot if log grows this big
+
+	// Represents in memory KV store
+	stateMachine map[string]string
+	// Stores Channeels that RPC hanlders are waiting on
 	opResponseWaiters map[int]chan OpResponse
+
+	// Duplicate table is used to prevent processing duplicate Put/Append/Get requests
+	// sent by Clerk
+	duplicateTable map[int64]OpResponse
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	command := Op{
-		Key:         args.Key,
-		Op:          "Get",
-		RequestUUID: args.RequestUUID,
+		Key:          args.Key,
+		Op:           "Get",
+		RequestSeqID: args.RequestSeqID,
 	}
 
 	index, _, isLeader := kv.rf.Start(command)
+	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.Lock()
-	Debug(dClient, "S%d received Get  Request %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
+	Debug(dClient, "S%d received Get  Request | after lock SM:%+v", kv.me, kv.stateMachine)
 	// We need to check if ApplyMsg receiver has  already received an apply message with current index
 	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
 	// buffer of 1. We can read the value in the buffered channel and return to client
@@ -75,7 +80,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// (i.e RequestUUID and index matches)
 	// the request has been sucessfully commited to stateMachine.
 	// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-	if opResponse.index == index && opResponse.RequestUUID == args.RequestUUID {
+	if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID && opResponse.clientID == args.ClientID {
 		reply.Err = OK
 	} else {
 		reply.Value = ""
@@ -84,14 +89,31 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+
+	// kv.mu.Lock()
+	// response := kv.duplicateTable[args.ClientID]
+	// kv.mu.Unlock()
+
+	// if response.requestSeqID == args.RequestSeqID {
+	// 	reply.Err = OK
+	// 	return
+	// }
+
+	// if args.RequestSeqID < response.requestSeqID {
+	// 	reply.Err = ErrStaleRequest
+	// 	return
+	// }
+
 	command := Op{
-		Key:         args.Key,
-		Value:       args.Value,
-		Op:          args.Op,
-		RequestUUID: args.RequestUUID,
+		Key:          args.Key,
+		Value:        args.Value,
+		Op:           args.Op,
+		RequestSeqID: args.RequestSeqID,
 	}
 
 	index, _, isLeader := kv.rf.Start(command)
+	// Debug(dClient, "S%d received PutAppend | before lock, index: %d, isLeader: %t ", kv.me, index, isLeader)
+	//Debug(dClient, "S%d received PutAppend | before lock, index: %d, isLeader:%t", kv.me, index, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -119,7 +141,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// (i.e RequestUUID and index matches)
 	// the request has been sucessfully commited to stateMachine.
 	// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-	if opResponse.index == index && opResponse.RequestUUID == args.RequestUUID {
+	if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID && opResponse.clientID == args.ClientID {
 		reply.Err = OK
 	} else {
 		reply.Err = ErrWrongLeader
@@ -170,12 +192,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	go kv.receiveApplyMessages()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.stateMachine = make(map[string]string)
 	kv.opResponseWaiters = make(map[int]chan OpResponse)
+	kv.duplicateTable = make(map[int64]OpResponse)
 
-	go kv.receiveApplyMessages()
 	return kv
 }
 
@@ -192,9 +215,11 @@ func (kv *KVServer) receiveApplyMessages() {
 				kv.applyOpToStateMachineL(op)
 				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
 				reponse := OpResponse{
-					RequestUUID: op.RequestUUID,
-					index:       applyMsg.CommandIndex,
+					requestSeqID: op.RequestSeqID,
+					clientID:     op.ClientID,
+					index:        applyMsg.CommandIndex,
 				}
+				// kv.duplicateTable[op.ClientID] = reponse
 				// RPC handler has created a channel that it is waiting on before replying to client request
 				if ok {
 					// Wakes up the RPC handler that is waiting on this channel.
