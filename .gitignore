@@ -3,3 +3,5 @@ api.key
 .api.key.trimmed
 *-handin.tar.gz
 output.log
+src/.DS_Store
+src/kvraft/out.log

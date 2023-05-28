@@ -48,6 +48,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Key:          args.Key,
 		Op:           "Get",
 		RequestSeqID: args.RequestSeqID,
+		ClientID:     args.ClientID,
 	}
 
 	index, _, isLeader := kv.rf.Start(command)
@@ -90,30 +91,31 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
-	// kv.mu.Lock()
-	// response := kv.duplicateTable[args.ClientID]
-	// kv.mu.Unlock()
+	kv.mu.Lock()
+	response := kv.duplicateTable[args.ClientID]
+	kv.mu.Unlock()
+	Debug(dClient, "S%d received PutAppend | before lock, reponse: %+v, args: %+v", kv.me, response, args)
 
-	// if response.requestSeqID == args.RequestSeqID {
-	// 	reply.Err = OK
-	// 	return
-	// }
+	if response.requestSeqID == args.RequestSeqID && response.clientID == args.ClientID {
+		reply.Err = OK
+		return
+	}
 
-	// if args.RequestSeqID < response.requestSeqID {
-	// 	reply.Err = ErrStaleRequest
-	// 	return
-	// }
+	if args.RequestSeqID < response.requestSeqID && response.clientID == args.ClientID {
+		reply.Err = ErrStaleRequest
+		return
+	}
 
 	command := Op{
 		Key:          args.Key,
 		Value:        args.Value,
 		Op:           args.Op,
 		RequestSeqID: args.RequestSeqID,
+		ClientID:     args.ClientID,
 	}
 
 	index, _, isLeader := kv.rf.Start(command)
 	// Debug(dClient, "S%d received PutAppend | before lock, index: %d, isLeader: %t ", kv.me, index, isLeader)
-	//Debug(dClient, "S%d received PutAppend | before lock, index: %d, isLeader:%t", kv.me, index, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -219,7 +221,7 @@ func (kv *KVServer) receiveApplyMessages() {
 					clientID:     op.ClientID,
 					index:        applyMsg.CommandIndex,
 				}
-				// kv.duplicateTable[op.ClientID] = reponse
+				kv.duplicateTable[op.ClientID] = reponse
 				// RPC handler has created a channel that it is waiting on before replying to client request
 				if ok {
 					// Wakes up the RPC handler that is waiting on this channel.
@@ -234,7 +236,7 @@ func (kv *KVServer) receiveApplyMessages() {
 				}
 			}
 		}
-		Debug(dCommit, "S%d applied message SM:%+v, WaitersMap: %+v", kv.me, kv.stateMachine, kv.opResponseWaiters)
+		Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
 
 		kv.mu.Unlock()
 	}
