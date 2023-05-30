@@ -229,7 +229,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log.truncatePrefix(index)
 	rf.persist()
 
-	Debug(dSnap, "S%d received and updated Snapshot at index: %d,   RAFT: %+v", rf.me, index, rf)
+	Debug(dSnap, "S%d received and updated Snapshot at index: %d", rf.me, index)
 
 }
 
@@ -350,7 +350,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.XTerm = -1
 	reply.XLen = -1
 
-	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, args = %+v", rf.me, args.LeaderId, args)
+	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, prevlogIndex: %d, prevLogTerm: %d, term: %d, leaderCommit: %d",
+		rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Term, args.LeaderCommit)
 
 	if currentTerm > args.Term {
 		return
@@ -414,7 +415,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	Debug(dWarn, "S%d replying succes to AppendEntries RPC from S%d, args = %+v, log = %+v", rf.me, args.LeaderId, args, rf.log.Log)
+	Debug(dWarn, "S%d replying success to AppendEntries RPC from S%d, prevlogIndex: %d, prevLogTerm: %d, term: %d, leaderCommit: %d",
+		rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Term, args.LeaderCommit)
 
 	if args.LeaderCommit > rf.commitIndex {
 		min := min(args.LeaderCommit, rf.log.lastLogIndex())
@@ -778,7 +780,7 @@ func (rf *Raft) processAppendEntriesReply(server int, args *AppendEntriesArgs, r
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	currentTerm := rf.currentTerm
-	Debug(dError, "S%d received reply  from S%d reply = %+v with args = %+v, amILeader = %t", rf.me, server, reply, args, rf.currentState == leader)
+	Debug(dError, "S%d received reply  from S%d reply = %+v v, amILeader = %t", rf.me, server, reply, rf.currentState == leader)
 
 	if reply.Term > currentTerm {
 		rf.revertToFollowerStateL(reply.Term)

@@ -58,19 +58,20 @@ func (ck *Clerk) Get(key string) string {
 	reply := GetReply{}
 	var i = ck.lastServer
 	for ; i < len(ck.servers); i++ {
-		ok := false
-		for !ok {
-			ok = ck.servers[i].Call("KVServer.Get", &args, &reply)
-		}
-		if reply.Err == OK {
+		Debug(dClient, "Clerk: %d is calling Get on server: %d, args: %+v", ck.clientID, i, args)
+		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
+		Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply {Err: %s, ServerID: %d}",
+			ck.clientID, i, ok, args, reply.Err, reply.ServerID)
+
+		if ok && reply.Err == OK {
 			ck.lastServer = i
 			return reply.Value
 		} else {
-			// For now Get request tries another server from the list
+			// For now  request tries another server from the list
 			// TODO: Build optimization that will receive a LeaderID on ErrWrongLeader
 			// will make quuery to Leader
 
-			// If client has already looped through all the servers and did not find the Leader, need to try again
+			// If client has already looped through all the servers and did not find the Leader, need to start loop again
 			if i == len(ck.servers)-1 {
 				i = -1
 			}
@@ -107,27 +108,29 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	var i = ck.lastServer
 	for ; i < len(ck.servers); i++ {
-		// Debug(dClient, "Clerk is calling  PutAppend on  server: %d, args: %+v", i, args)
-		ok := false
+		Debug(dClient, "Clerk: %d is calling  PutAppend on  server: %d, args: %+v", ck.clientID, i, args)
+		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
+		Debug(dClient, "Clerk: %d has received reply  for  PutAppend from server: %d, OK: %t,  args: %+v, reply: %+v",
+			ck.clientID, i, ok, args, reply)
 
-		for !ok {
-			ok = ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-		}
-
-		Debug(dClient, "Clerk has received reply  for  PutAppend on  server: %d, reply: %+v", i, reply)
-		if reply.Err == OK {
+		if ok && reply.Err == OK {
 			ck.lastServer = i
 			return
 		} else {
-			// For now Get request tries another server from the list
+			// The RPC request is stale, no need to continue
+			if reply.Err == ErrStaleRequest {
+				return
+			}
+			// For now  request tries another server from the list
 			// TODO: Build optimization that will receive a LeaderID on ErrWrongLeader
 			// will make quuery to Leader
 
-			// If client has already looped through all the servers and did not find the Leader, need to try again
+			// If client has already looped through all the servers and did not find the Leader, need to start loop again
 			if i == len(ck.servers)-1 {
 				i = -1
 			}
 		}
+
 	}
 }
 

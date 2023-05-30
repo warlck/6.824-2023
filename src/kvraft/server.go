@@ -41,6 +41,9 @@ type KVServer struct {
 	// Duplicate table is used to prevent processing duplicate Put/Append/Get requests
 	// sent by Clerk
 	duplicateTable map[int64]OpResponse
+
+	// Channel to receives a signal whenever Raft's term has changed
+	termChangedCh chan int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -51,6 +54,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientID:     args.ClientID,
 	}
 
+	reply.ServerID = kv.me
 	index, _, isLeader := kv.rf.Start(command)
 	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
 	if !isLeader {
@@ -58,8 +62,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
+	Debug(dClient, "S%d received Get  Request | before lock, args: %+v, index: %d, isLeader: %t",
+		kv.me, args, index, isLeader)
 	kv.mu.Lock()
-	Debug(dClient, "S%d received Get  Request | after lock SM:%+v", kv.me, kv.stateMachine)
+	Debug(dClient, "S%d received Get  Request | after lock", kv.me)
 	// We need to check if ApplyMsg receiver has  already received an apply message with current index
 	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
 	// buffer of 1. We can read the value in the buffered channel and return to client
@@ -94,8 +100,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	response := kv.duplicateTable[args.ClientID]
 	kv.mu.Unlock()
+
 	Debug(dClient, "S%d received PutAppend | before lock, reponse: %+v, args: %+v", kv.me, response, args)
 
+	reply.ServerID = kv.me
 	if response.requestSeqID == args.RequestSeqID && response.clientID == args.ClientID {
 		reply.Err = OK
 		return
@@ -210,7 +218,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) receiveApplyMessages() {
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock()
-		Debug(dCommit, "S%d received message %+v, SM: %+v", kv.me, applyMsg, kv.stateMachine)
+		Debug(dCommit, "S%d received message %+v", kv.me, applyMsg)
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
@@ -236,7 +244,7 @@ func (kv *KVServer) receiveApplyMessages() {
 				}
 			}
 		}
-		Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
+		//	Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
 
 		kv.mu.Unlock()
 	}
