@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -41,9 +42,6 @@ type KVServer struct {
 	// Duplicate table is used to prevent processing duplicate Put/Append/Get requests
 	// sent by Clerk
 	duplicateTable map[int64]OpResponse
-
-	// Channel to receives a signal whenever Raft's term has changed
-	termChangedCh chan int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -55,7 +53,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	reply.ServerID = kv.me
-	index, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -80,18 +78,41 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Value = kv.stateMachine[args.Key]
 	kv.mu.Unlock()
 
-	opResponse := <-responseWaiter
-	// Clear the channel from the Server's reponsewaiters
-	go kv.removeResponseWaiter(index)
-	// If the command that Raft applied, matches the command that this RPC handlder has submitted
-	// (i.e RequestUUID and index matches)
-	// the request has been sucessfully commited to stateMachine.
-	// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-	if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID && opResponse.clientID == args.ClientID {
-		reply.Err = OK
-	} else {
-		reply.Value = ""
-		reply.Err = ErrWrongLeader
+	defer func() {
+		// Clear the channel from the reponsewaiters map
+		go kv.removeResponseWaiter(index)
+	}()
+
+	// Listen for an event of receving the applyMessage at expected index or for term change
+	for {
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case opResponse := <-responseWaiter:
+			timer.Stop()
+			// If the command that Raft applied, matches the command that this RPC handlder has submitted
+			// (i.e RequestUUID and index matches)
+			// the request has been sucessfully commited to stateMachine.
+			// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
+			if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID &&
+				opResponse.clientID == args.ClientID {
+				reply.Err = OK
+			} else {
+				reply.Value = ""
+				reply.Err = ErrWrongLeader
+			}
+			return
+		case <-timer.C:
+			// Timer has fired and no message is received for the expected index in apply channel
+			// Either KV server is partitioned, or Raft term has changed
+			// Do nothing if term has not changed
+			// If Raft term has progressed, reply error to the RPC request
+			newTerm, _ := kv.rf.GetState()
+			if newTerm > term {
+				reply.Err = ErrWrongLeader
+				reply.Value = ""
+				return
+			}
+		}
 	}
 }
 
@@ -122,7 +143,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientID:     args.ClientID,
 	}
 
-	index, _, isLeader := kv.rf.Start(command)
+	index, term, isLeader := kv.rf.Start(command)
 	// Debug(dClient, "S%d received PutAppend | before lock, index: %d, isLeader: %t ", kv.me, index, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -144,19 +165,40 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 
-	opResponse := <-responseWaiter
-	// Clear the channel from the reponsewaiters map
-	go kv.removeResponseWaiter(index)
-	// If the command that Raft applied, matches the command that this RPC handlder has submitted
-	// (i.e RequestUUID and index matches)
-	// the request has been sucessfully commited to stateMachine.
-	// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-	if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID && opResponse.clientID == args.ClientID {
-		reply.Err = OK
-	} else {
-		reply.Err = ErrWrongLeader
-	}
+	defer func() {
+		// Clear the channel from the reponsewaiters map
+		go kv.removeResponseWaiter(index)
+	}()
 
+	// Listen for an event of receving the applyMessage at expected index or for term change
+	for {
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case opResponse := <-responseWaiter:
+			timer.Stop()
+			// If the command that Raft applied, matches the command that this RPC handlder has submitted
+			// (i.e RequestUUID and index matches)
+			// the request has been sucessfully commited to stateMachine.
+			// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
+			if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID &&
+				opResponse.clientID == args.ClientID {
+				reply.Err = OK
+			} else {
+				reply.Err = ErrWrongLeader
+			}
+			return
+		case <-timer.C:
+			// Timer has fired and no message is received for the expected index in apply channel
+			// Either KV server is partitioned, or Raft term has changed
+			// Do nothing if term has not changed
+			// If Raft term has progressed, reply error to the RPC request
+			newTerm, _ := kv.rf.GetState()
+			if newTerm > term {
+				reply.Err = ErrWrongLeader
+				return
+			}
+		}
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -222,26 +264,32 @@ func (kv *KVServer) receiveApplyMessages() {
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
-				kv.applyOpToStateMachineL(op)
-				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
-				reponse := OpResponse{
+				// response := kv.duplicateTable[op.ClientID]
+				// if op.RequestSeqID > response.requestSeqID && op.ClientID == response.clientID {
+				response := OpResponse{
 					requestSeqID: op.RequestSeqID,
 					clientID:     op.ClientID,
 					index:        applyMsg.CommandIndex,
 				}
-				kv.duplicateTable[op.ClientID] = reponse
+
+				kv.duplicateTable[op.ClientID] = response
+				kv.applyOpToStateMachineL(op)
+				// }
+
+				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
 				// RPC handler has created a channel that it is waiting on before replying to client request
 				if ok {
 					// Wakes up the RPC handler that is waiting on this channel.
 					// This is safe, as the channel needs to be buffered.
-					reponseWaiter <- reponse
+					reponseWaiter <- response
 				} else {
 					// If RPC handler was late to create a channel,  create a buffered channel
 					// for RPC handler to eventually read and reply to client
 					bufferedWaiter := make(chan OpResponse, 1)
-					bufferedWaiter <- reponse
+					bufferedWaiter <- response
 					kv.opResponseWaiters[applyMsg.CommandIndex] = bufferedWaiter
 				}
+
 			}
 		}
 		//	Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
