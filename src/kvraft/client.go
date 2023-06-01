@@ -28,6 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.clientID = nrand()
+	ck.requestSequenceNo = 1
 	// You'll have to add code here.
 	return ck
 }

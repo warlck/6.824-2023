@@ -88,7 +88,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case opResponse := <-responseWaiter:
-			timer.Stop()
+			go func(timer *time.Timer) {
+				if !timer.Stop() {
+					<-timer.C
+				}
+			}(timer)
+
 			// If the command that Raft applied, matches the command that this RPC handlder has submitted
 			// (i.e RequestUUID and index matches)
 			// the request has been sucessfully commited to stateMachine.
@@ -175,7 +180,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case opResponse := <-responseWaiter:
-			timer.Stop()
+			go func(timer *time.Timer) {
+				if !timer.Stop() {
+					<-timer.C
+				}
+			}(timer)
+
+			Debug(dClient, "S%d PutAppend | after received opResponse: %+v, args: %+v", kv.me, opResponse, args)
 			// If the command that Raft applied, matches the command that this RPC handlder has submitted
 			// (i.e RequestUUID and index matches)
 			// the request has been sucessfully commited to stateMachine.
@@ -260,21 +271,21 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) receiveApplyMessages() {
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock()
-		Debug(dCommit, "S%d received message %+v", kv.me, applyMsg)
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
-				// response := kv.duplicateTable[op.ClientID]
-				// if op.RequestSeqID > response.requestSeqID && op.ClientID == response.clientID {
-				response := OpResponse{
-					requestSeqID: op.RequestSeqID,
-					clientID:     op.ClientID,
-					index:        applyMsg.CommandIndex,
-				}
+				response := kv.duplicateTable[op.ClientID]
+				Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, response)
+				if op.RequestSeqID > response.requestSeqID {
+					response = OpResponse{
+						requestSeqID: op.RequestSeqID,
+						clientID:     op.ClientID,
+						index:        applyMsg.CommandIndex,
+					}
 
-				kv.duplicateTable[op.ClientID] = response
-				kv.applyOpToStateMachineL(op)
-				// }
+					kv.duplicateTable[op.ClientID] = response
+					kv.applyOpToStateMachineL(op)
+				}
 
 				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
 				// RPC handler has created a channel that it is waiting on before replying to client request
