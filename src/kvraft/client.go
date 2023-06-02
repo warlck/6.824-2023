@@ -56,13 +56,15 @@ func (ck *Clerk) Get(key string) string {
 		ClientID:     ck.clientID,
 	}
 
-	reply := GetReply{}
 	var i = ck.lastServer
 	for ; i < len(ck.servers); i++ {
+		reply := GetReply{}
 		Debug(dClient, "Clerk: %d is calling Get on server: %d, args: %+v", ck.clientID, i, args)
 		ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-		Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply {Err: %s, ServerID: %d}",
-			ck.clientID, i, ok, args, reply.Err, reply.ServerID)
+		// Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply {Err: %s, ServerID: %d}",
+		// 	ck.clientID, i, ok, args, reply.Err, reply.ServerID)
+		Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply: %+v",
+			ck.clientID, i, ok, args, reply)
 
 		if ok && reply.Err == OK {
 			ck.lastServer = i
@@ -79,7 +81,6 @@ func (ck *Clerk) Get(key string) string {
 		}
 	}
 
-	// You will have to modify this function.
 	return ""
 }
 
@@ -109,6 +110,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	var i = ck.lastServer
 	for ; i < len(ck.servers); i++ {
+
 		Debug(dClient, "Clerk: %d is calling  PutAppend on  server: %d, args: %+v", ck.clientID, i, args)
 		ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
 		Debug(dClient, "Clerk: %d has received reply  for  PutAppend from server: %d, OK: %t,  args: %+v, reply: %+v",

@@ -350,8 +350,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.XTerm = -1
 	reply.XLen = -1
 
-	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, prevlogIndex: %d, prevLogTerm: %d, term: %d, leaderCommit: %d",
-		rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Term, args.LeaderCommit)
+	// Debug(dInfo, "S%d, received AppendEntries RPC from S%d, prevlogIndex: %d, prevLogTerm: %d, term: %d, leaderCommit: %d",
+	// 	rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Term, args.LeaderCommit)
+	Debug(dInfo, "S%d, received AppendEntries RPC from S%d, args: %+v",
+		rf.me, args.LeaderId, args)
 
 	if currentTerm > args.Term {
 		return
@@ -415,8 +417,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	Debug(dWarn, "S%d replying success to AppendEntries RPC from S%d, prevlogIndex: %d, prevLogTerm: %d, term: %d, leaderCommit: %d",
-		rf.me, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.Term, args.LeaderCommit)
+	Debug(dWarn, "S%d replying success to AppendEntries RPC from S%d, args: %+v",
+		rf.me, args.LeaderId, args)
 
 	if args.LeaderCommit > rf.commitIndex {
 		min := min(args.LeaderCommit, rf.log.lastLogIndex())
@@ -951,4 +953,8 @@ func (rf *Raft) InstallSnapshot(args *IntallSnapshotRequest, reply *IntallSnapsh
 	rf.persist()
 	go rf.UpdatedCommitIndex(args.LastIncludedIndex)
 
+}
+
+func (rf *Raft) LogEntries() []LogEntry {
+	return rf.log.Log
 }

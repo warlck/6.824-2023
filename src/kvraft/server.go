@@ -45,6 +45,25 @@ type KVServer struct {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	kv.mu.Lock()
+	response := kv.duplicateTable[args.ClientID]
+	reply.Value = kv.stateMachine[args.Key]
+	kv.mu.Unlock()
+
+	Debug(dClient, "S%d received Get | before lock, reponse: %+v, args: %+v", kv.me, response, args)
+
+	reply.ServerID = kv.me
+	if response.requestSeqID == args.RequestSeqID && response.clientID == args.ClientID {
+		reply.Err = OK
+		return
+	}
+
+	if args.RequestSeqID < response.requestSeqID && response.clientID == args.ClientID {
+		reply.Err = ErrStaleRequest
+		reply.Value = ""
+		return
+	}
+
 	command := Op{
 		Key:          args.Key,
 		Op:           "Get",
@@ -52,11 +71,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientID:     args.ClientID,
 	}
 
-	reply.ServerID = kv.me
 	index, term, isLeader := kv.rf.Start(command)
 	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+		reply.Value = ""
 		return
 	}
 
@@ -262,6 +281,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.opResponseWaiters = make(map[int]chan OpResponse)
 	kv.duplicateTable = make(map[int64]OpResponse)
 
+	kv.initKVServer()
+
 	return kv
 }
 
@@ -274,15 +295,15 @@ func (kv *KVServer) receiveApplyMessages() {
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
-				response := kv.duplicateTable[op.ClientID]
-				Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, response)
-				if op.RequestSeqID > response.requestSeqID {
-					response = OpResponse{
-						requestSeqID: op.RequestSeqID,
-						clientID:     op.ClientID,
-						index:        applyMsg.CommandIndex,
-					}
+				dupTableEntry := kv.duplicateTable[op.ClientID]
+				response := OpResponse{
+					requestSeqID: op.RequestSeqID,
+					clientID:     op.ClientID,
+					index:        applyMsg.CommandIndex,
+				}
 
+				Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, dupTableEntry)
+				if op.RequestSeqID > dupTableEntry.requestSeqID {
 					kv.duplicateTable[op.ClientID] = response
 					kv.applyOpToStateMachineL(op)
 				}
@@ -303,7 +324,7 @@ func (kv *KVServer) receiveApplyMessages() {
 
 			}
 		}
-		//	Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
+		// Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
 
 		kv.mu.Unlock()
 	}
@@ -330,4 +351,17 @@ func (kv *KVServer) removeResponseWaiter(index int) {
 	defer kv.mu.Unlock()
 
 	delete(kv.opResponseWaiters, index)
+}
+
+func (kv *KVServer) initKVServer() {
+	for _, logEntry := range kv.rf.LogEntries() {
+		op, ok := logEntry.Command.(Op)
+		if ok {
+			kv.duplicateTable[op.ClientID] = OpResponse{
+				clientID:     op.ClientID,
+				requestSeqID: op.RequestSeqID,
+			}
+			kv.applyOpToStateMachineL(op)
+		}
+	}
 }
