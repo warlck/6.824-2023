@@ -87,14 +87,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
 	// buffer of 1. We can read the value in the buffered channel and return to client
 	responseWaiter, ok := kv.opResponseWaiters[index]
-
 	// If apply message with current index has not been processsed yet, create a channel that we use to wait
 	// for  Raft processing to complete.
 	if !ok {
 		responseWaiter = make(chan OpResponse, 1)
 		kv.opResponseWaiters[index] = responseWaiter
 	}
-	reply.Value = kv.stateMachine[args.Key]
 	kv.mu.Unlock()
 
 	defer func() {
@@ -120,6 +118,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID &&
 				opResponse.clientID == args.ClientID {
 				reply.Err = OK
+				kv.mu.Lock()
+				reply.Value = kv.stateMachine[args.Key]
+				kv.mu.Unlock()
 			} else {
 				reply.Value = ""
 				reply.Err = ErrWrongLeader
@@ -280,8 +281,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.stateMachine = make(map[string]string)
 	kv.opResponseWaiters = make(map[int]chan OpResponse)
 	kv.duplicateTable = make(map[int64]OpResponse)
-
-	kv.initKVServer()
 
 	return kv
 }
