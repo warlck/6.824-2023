@@ -1,7 +1,9 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,17 +22,18 @@ type Op struct {
 }
 
 type OpResponse struct {
-	requestSeqID int64
-	index        int
-	clientID     int64
+	RequestSeqID int64
+	Index        int
+	ClientID     int64
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	persister *raft.Persister
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -53,12 +56,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	Debug(dClient, "S%d received Get | before lock, reponse: %+v, args: %+v", kv.me, response, args)
 
 	reply.ServerID = kv.me
-	if response.requestSeqID == args.RequestSeqID && response.clientID == args.ClientID {
+	if response.RequestSeqID == args.RequestSeqID && response.ClientID == args.ClientID {
 		reply.Err = OK
 		return
 	}
 
-	if args.RequestSeqID < response.requestSeqID && response.clientID == args.ClientID {
+	if args.RequestSeqID < response.RequestSeqID && response.ClientID == args.ClientID {
 		reply.Err = ErrStaleRequest
 		reply.Value = ""
 		return
@@ -115,8 +118,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			// (i.e RequestUUID and index matches)
 			// the request has been sucessfully commited to stateMachine.
 			// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-			if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID &&
-				opResponse.clientID == args.ClientID {
+			if opResponse.Index == index && opResponse.RequestSeqID == args.RequestSeqID &&
+				opResponse.ClientID == args.ClientID {
 				reply.Err = OK
 				kv.mu.Lock()
 				reply.Value = kv.stateMachine[args.Key]
@@ -150,12 +153,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	Debug(dClient, "S%d received PutAppend | before lock, reponse: %+v, args: %+v", kv.me, response, args)
 
 	reply.ServerID = kv.me
-	if response.requestSeqID == args.RequestSeqID && response.clientID == args.ClientID {
+	if response.RequestSeqID == args.RequestSeqID && response.ClientID == args.ClientID {
 		reply.Err = OK
 		return
 	}
 
-	if args.RequestSeqID < response.requestSeqID && response.clientID == args.ClientID {
+	if args.RequestSeqID < response.RequestSeqID && response.ClientID == args.ClientID {
 		reply.Err = ErrStaleRequest
 		return
 	}
@@ -211,8 +214,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			// (i.e RequestUUID and index matches)
 			// the request has been sucessfully commited to stateMachine.
 			// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-			if opResponse.index == index && opResponse.requestSeqID == args.RequestSeqID &&
-				opResponse.clientID == args.ClientID {
+			if opResponse.Index == index && opResponse.RequestSeqID == args.RequestSeqID &&
+				opResponse.ClientID == args.ClientID {
 				reply.Err = OK
 			} else {
 				reply.Err = ErrWrongLeader
@@ -276,11 +279,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	go kv.receiveApplyMessages()
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
+	kv.rf = raft.Make(servers, me, kv.persister, kv.applyCh)
 
 	kv.stateMachine = make(map[string]string)
 	kv.opResponseWaiters = make(map[int]chan OpResponse)
 	kv.duplicateTable = make(map[int64]OpResponse)
+
+	kv.readPersist(persister.ReadSnapshot())
 
 	return kv
 }
@@ -296,15 +302,16 @@ func (kv *KVServer) receiveApplyMessages() {
 			if ok {
 				dupTableEntry := kv.duplicateTable[op.ClientID]
 				response := OpResponse{
-					requestSeqID: op.RequestSeqID,
-					clientID:     op.ClientID,
-					index:        applyMsg.CommandIndex,
+					RequestSeqID: op.RequestSeqID,
+					ClientID:     op.ClientID,
+					Index:        applyMsg.CommandIndex,
 				}
 
 				Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, dupTableEntry)
-				if op.RequestSeqID > dupTableEntry.requestSeqID {
+				if op.RequestSeqID > dupTableEntry.RequestSeqID {
 					kv.duplicateTable[op.ClientID] = response
 					kv.applyOpToStateMachineL(op)
+					kv.snapShotState(applyMsg.CommandIndex)
 				}
 
 				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
@@ -357,10 +364,53 @@ func (kv *KVServer) initKVServer() {
 		op, ok := logEntry.Command.(Op)
 		if ok {
 			kv.duplicateTable[op.ClientID] = OpResponse{
-				clientID:     op.ClientID,
-				requestSeqID: op.RequestSeqID,
+				ClientID:     op.ClientID,
+				RequestSeqID: op.RequestSeqID,
 			}
 			kv.applyOpToStateMachineL(op)
 		}
 	}
+}
+
+func (kv *KVServer) snapShotState(index int) {
+	if kv.maxraftstate < 0 {
+		return
+	}
+
+	if len(kv.persister.ReadRaftState()) >= 9*kv.maxraftstate/10 {
+		data := kv.snapshotData()
+		go kv.rf.Snapshot(index, data)
+	}
+}
+
+func (kv *KVServer) snapshotData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.duplicateTable)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var stateMachine map[string]string
+	var duplicateTable map[int64]OpResponse
+	var err error
+
+	if err := d.Decode(&stateMachine); err != nil {
+		log.Fatal("Failed to read log from persistent state", err)
+	}
+
+	if err = d.Decode(&duplicateTable); err != nil {
+		log.Fatal("Failed to read votedFor from persistent state", err)
+	}
+
+	kv.stateMachine = stateMachine
+	kv.duplicateTable = duplicateTable
 }
