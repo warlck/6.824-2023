@@ -286,7 +286,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.opResponseWaiters = make(map[int]chan OpResponse)
 	kv.duplicateTable = make(map[int64]OpResponse)
 
-	kv.readPersist(persister.ReadSnapshot())
+	kv.installStateFromSnapshot(persister.ReadSnapshot())
 
 	return kv
 }
@@ -311,7 +311,7 @@ func (kv *KVServer) receiveApplyMessages() {
 				if op.RequestSeqID > dupTableEntry.RequestSeqID {
 					kv.duplicateTable[op.ClientID] = response
 					kv.applyOpToStateMachineL(op)
-					kv.snapShotState(applyMsg.CommandIndex)
+					kv.snapShotKVState(applyMsg.CommandIndex)
 				}
 
 				reponseWaiter, ok := kv.opResponseWaiters[applyMsg.CommandIndex]
@@ -329,6 +329,8 @@ func (kv *KVServer) receiveApplyMessages() {
 				}
 
 			}
+		} else if applyMsg.SnapshotValid {
+			kv.installStateFromSnapshot(applyMsg.Snapshot)
 		}
 		// Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
 
@@ -372,14 +374,14 @@ func (kv *KVServer) initKVServer() {
 	}
 }
 
-func (kv *KVServer) snapShotState(index int) {
+func (kv *KVServer) snapShotKVState(index int) {
 	if kv.maxraftstate < 0 {
 		return
 	}
 
 	if len(kv.persister.ReadRaftState()) >= 9*kv.maxraftstate/10 {
 		data := kv.snapshotData()
-		go kv.rf.Snapshot(index, data)
+		kv.rf.Snapshot(index, data)
 	}
 }
 
@@ -391,7 +393,7 @@ func (kv *KVServer) snapshotData() []byte {
 	return w.Bytes()
 }
 
-func (kv *KVServer) readPersist(data []byte) {
+func (kv *KVServer) installStateFromSnapshot(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}

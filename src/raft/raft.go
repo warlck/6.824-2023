@@ -221,6 +221,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	Debug(dSnap, "S%d received Snapshot request at index: %d, rf.log = %+v", rf.me, index, rf.log)
+
+	//received stale request to snapshot
+	if index <= rf.snap.lastIncludedIndex {
+		return
+	}
 
 	rf.snap.data = snapshot
 	rf.snap.lastIncludedTerm = rf.logTerm(index)
@@ -884,13 +890,14 @@ func (rf *Raft) sendInstallSnapshotL(server int) {
 		LeaderID:          rf.me,
 		LastIncludedIndex: rf.snap.lastIncludedIndex,
 		LastIncludedTerm:  rf.snap.lastIncludedTerm,
-		Data:              rf.snap.data,
-		Done:              true,
+		// Data:              rf.snap.data,
+		Done: true,
 	}
 
 	reply := IntallSnapshotReply{}
 	Debug(dSnap, "S%d sending InstallSnapshot to S%d args = %+v", rf.me, server, args)
-	go func() {
+	args.Data = rf.snap.data
+	go func(server int) {
 		for {
 			ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 			if ok {
@@ -908,14 +915,20 @@ func (rf *Raft) sendInstallSnapshotL(server int) {
 				break
 			}
 		}
-	}()
+	}(server)
 
 }
 
 func (rf *Raft) InstallSnapshot(args *IntallSnapshotRequest, reply *IntallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Debug(dSnap, "S%d received InstallSnapshot args = %+v", rf.me, args)
+	noDataArgs := IntallSnapshotRequest{
+		Term:              args.Term,
+		LeaderID:          args.LeaderID,
+		LastIncludedIndex: args.LastIncludedIndex,
+		LastIncludedTerm:  args.LastIncludedTerm,
+	}
+	Debug(dSnap, "S%d received InstallSnapshot args = %+v", rf.me, noDataArgs)
 
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term {
