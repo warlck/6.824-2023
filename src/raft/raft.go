@@ -741,11 +741,12 @@ func (rf *Raft) UpdatedCommitIndex(newCommitIndex int) {
 }
 
 func (rf *Raft) applyMessages() {
-	for newCommitIndex := range rf.commitCh {
-
+	for {
 		if rf.killed() {
 			return
 		}
+
+		newCommitIndex := <-rf.commitCh
 		var msg ApplyMsg
 		entiesToApply := make([]ApplyMsg, 0)
 		rf.mu.Lock()
@@ -899,6 +900,10 @@ func (rf *Raft) sendInstallSnapshotL(server int) {
 	args.Data = rf.snap.data
 	go func(server int) {
 		for {
+			if rf.killed() {
+				return
+			}
+
 			ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 			if ok {
 				rf.mu.Lock()

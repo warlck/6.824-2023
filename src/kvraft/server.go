@@ -295,7 +295,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 // The main task of the method is to wake up the RPC handler that is waiting on applied message
 // at particular log index
 func (kv *KVServer) receiveApplyMessages() {
-	for applyMsg := range kv.applyCh {
+	for {
+		if kv.killed() {
+			return
+		}
+
+		applyMsg := <-kv.applyCh
 		kv.mu.Lock()
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
