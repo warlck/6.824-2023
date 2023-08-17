@@ -774,6 +774,10 @@ func (rf *Raft) applyMessages() {
 			rf.lastApplied = newCommitIndex
 		}
 		rf.mu.Unlock()
+
+		if rf.killed() {
+			return
+		}
 		if msg.SnapshotValid {
 			rf.applyCh <- msg
 		}

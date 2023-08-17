@@ -29,13 +29,22 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK              = "OK"
+	ErrStaleRequest = "ErrStaleRequest"
+	ErrWrongLeader  = "ErrWrongLeader"
+
+	Join  = "Join"
+	Leave = "Leave"
+	Move  = "Move"
+	Query = "Query"
 )
 
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers      map[int][]string // new GID -> servers mappings
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type JoinReply struct {
