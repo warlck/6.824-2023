@@ -39,6 +39,11 @@ const (
 	Query = "Query"
 )
 
+type Replier interface {
+	ReplyOK()
+	ReplyWrongLeader()
+}
+
 type Err string
 
 type JoinArgs struct {
@@ -52,8 +57,19 @@ type JoinReply struct {
 	Err         Err
 }
 
+func (j *JoinReply) ReplyOK() {
+	j.Err = OK
+}
+
+func (j *JoinReply) ReplyWrongLeader() {
+	j.Err = ErrWrongLeader
+	j.WrongLeader = true
+}
+
 type LeaveArgs struct {
-	GIDs []int
+	GIDs         []int
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type LeaveReply struct {
@@ -61,9 +77,19 @@ type LeaveReply struct {
 	Err         Err
 }
 
+func (l *LeaveReply) ReplyOK() {
+	l.Err = OK
+}
+func (l *LeaveReply) ReplyWrongLeader() {
+	l.Err = ErrWrongLeader
+	l.WrongLeader = true
+}
+
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard        int
+	GID          int
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type MoveReply struct {
@@ -71,12 +97,30 @@ type MoveReply struct {
 	Err         Err
 }
 
+func (m *MoveReply) ReplyOK() {
+	m.Err = OK
+}
+func (m *MoveReply) ReplyWrongLeader() {
+	m.Err = ErrWrongLeader
+	m.WrongLeader = true
+}
+
 type QueryArgs struct {
-	Num int // desired config number
+	Num          int // desired config number
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+func (q *QueryReply) ReplyOK() {
+	q.Err = OK
+}
+func (q *QueryReply) ReplyWrongLeader() {
+	q.Err = ErrWrongLeader
+	q.WrongLeader = true
 }

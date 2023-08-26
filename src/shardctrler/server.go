@@ -1,9 +1,9 @@
 package shardctrler
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -28,7 +28,11 @@ type ShardCtrler struct {
 }
 
 type Op struct {
-	Args         interface{}
+	Servers      map[int][]string
+	GIDs         []int
+	Shard        int
+	GID          int
+	Num          int
 	Op           string
 	RequestSeqID int64
 	ClientID     int64
@@ -48,32 +52,78 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 
 	command := Op{
-		Args:         args,
+		Servers:      args.Servers,
 		Op:           Join,
 		RequestSeqID: args.RequestSeqID,
 		ClientID:     args.ClientID,
 	}
 
-	err = sc.processRaftResponse(command, args.ClientID, args.RequestSeqID)
-	reply.Err = err
-	if err == OK {
-		return
-	} else if err == ErrWrongLeader {
-		reply.WrongLeader = true
-		return
-	}
+	sc.processRaftMessage(command, args.ClientID, args.RequestSeqID, reply)
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
-	// Your code here.
+	err, ret := sc.checkRepeatRequest(args.ClientID, args.RequestSeqID)
+	if ret {
+		reply.Err = err
+		return
+	}
+
+	command := Op{
+		GIDs:         args.GIDs,
+		Op:           Leave,
+		RequestSeqID: args.RequestSeqID,
+		ClientID:     args.ClientID,
+	}
+
+	sc.processRaftMessage(command, args.ClientID, args.RequestSeqID, reply)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
-	// Your code here.
+	err, ret := sc.checkRepeatRequest(args.ClientID, args.RequestSeqID)
+	if ret {
+		reply.Err = err
+		return
+	}
+
+	command := Op{
+		GID:          args.GID,
+		Shard:        args.Shard,
+		Op:           Move,
+		RequestSeqID: args.RequestSeqID,
+		ClientID:     args.ClientID,
+	}
+
+	sc.processRaftMessage(command, args.ClientID, args.RequestSeqID, reply)
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
-	// Your code here.
+	err, ret := sc.checkRepeatRequest(args.ClientID, args.RequestSeqID)
+	if ret {
+		reply.Err = err
+		return
+	}
+
+	command := Op{
+		Num:          args.Num,
+		Op:           Query,
+		RequestSeqID: args.RequestSeqID,
+		ClientID:     args.ClientID,
+	}
+
+	sc.processRaftMessage(command, args.ClientID, args.RequestSeqID, reply)
+	// Put the config data in Reply if Err is  OK
+	if reply.WrongLeader {
+		return
+	}
+
+	// Replies with the lastest configuration if f the number is -1 or bigger than the biggest known configuration number
+	lastConfig := sc.configs[len(sc.configs)-1]
+	if args.Num <= -1 || args.Num > lastConfig.Num {
+		reply.Config = lastConfig
+	} else {
+		reply.Config = sc.configs[args.Num]
+	}
+
 }
 
 // the tester calls Kill() when a ShardCtrler instance won't
@@ -118,94 +168,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	return sc
 }
 
-// Clears the response waiter channel that was used to by RPC KVServer's RPC handlers
-func (sc *ShardCtrler) removeResponseWaiter(index int) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	delete(sc.opResponseWaiters, index)
-}
-
-func (sc *ShardCtrler) checkRepeatRequest(clientID, requestSeqID int64) (Err, bool) {
-	sc.mu.Lock()
-	response := sc.duplicateTable[clientID]
-	sc.mu.Unlock()
-
-	// Debug(dClient, "S%d received Join | before lock, reponse: %+v, args: %+v", kv.me, response, args)
-
-	if response.RequestSeqID == requestSeqID && response.ClientID == clientID {
-		return OK, true
-	}
-
-	if requestSeqID < response.RequestSeqID && response.ClientID == clientID {
-		return ErrStaleRequest, true
-	}
-	return "", false
-}
-
-func (sc *ShardCtrler) processRaftResponse(command Op, clientID int64, requestSeqID int64) Err {
-	index, term, isLeader := sc.rf.Start(command)
-	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
-	if !isLeader {
-		return ErrWrongLeader
-	}
-
-	// Debug(dClient, "S%d received Get  Request | before lock, args: %+v, index: %d, isLeader: %t",
-	// kv.me, args, index, isLeader)
-	sc.mu.Lock()
-	// Debug(dClient, "S%d received Get  Request | after lock", kv.me)
-
-	// We need to check if ApplyMsg receiver has  already received an apply message with current index
-	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
-	// buffer of 1. We can read the value in the buffered channel and return to client
-	responseWaiter, ok := sc.opResponseWaiters[index]
-	// If apply message with current index has not been processsed yet, create a channel that we use to wait
-	// for  Raft processing to complete.
-	if !ok {
-		responseWaiter = make(chan OpResponse, 1)
-		sc.opResponseWaiters[index] = responseWaiter
-	}
-	sc.mu.Unlock()
-
-	defer func() {
-		// Clear the channel from the reponsewaiters map
-		go sc.removeResponseWaiter(index)
-	}()
-
-	// Listen for an event of receving the applyMessage at expected index or for term change
-	for {
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case opResponse := <-responseWaiter:
-			go func(timer *time.Timer) {
-				if !timer.Stop() {
-					<-timer.C
-				}
-			}(timer)
-
-			// If the command that Raft applied, matches the command that this RPC handlder has submitted
-			// (i.e RequestID and index matches)
-			// the request has been sucessfully commited to stateMachine.
-			// Othwerwise, Raft server have lost the leadership and another leader submitted different entry to stateMachine.
-			if opResponse.Index == index && opResponse.RequestSeqID == requestSeqID &&
-				opResponse.ClientID == clientID {
-				return OK
-			} else {
-				return ErrWrongLeader
-			}
-		case <-timer.C:
-			// Timer has fired and no message is received for the expected index in apply channel
-			// Either SC server is partitioned, or Raft term has changed
-			// Do nothing if term has not changed
-			// If Raft term has progressed, reply error to the RPC request
-			newTerm, _ := sc.rf.GetState()
-			if newTerm > term {
-				return ErrWrongLeader
-			}
-		}
-	}
-}
-
 // Processes incoming ApplyMsg values that were processed and passed from Raft.
 // The main task of the method is to wake up the RPC handler that is waiting on applied message
 // at particular log index
@@ -227,7 +189,7 @@ func (sc *ShardCtrler) receiveApplyMessages() {
 					Index:        applyMsg.CommandIndex,
 				}
 
-				// Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, dupTableEntry)
+				Debug(dCommit, "S%d received message: %+v, response: %+v ", sc.me, applyMsg, dupTableEntry)
 				if op.RequestSeqID > dupTableEntry.RequestSeqID {
 					sc.duplicateTable[op.ClientID] = response
 					sc.applyOpToStateMachineL(op)
@@ -249,14 +211,82 @@ func (sc *ShardCtrler) receiveApplyMessages() {
 
 			}
 		}
-		// Debug(dCommit, "S%d applied message SM:%+v", kv.me, kv.stateMachine)
+		Debug(dCommit, "S%d applied message SM:%+v", sc.me, sc.configs)
 		sc.mu.Unlock()
 	}
 }
 
 func (sc *ShardCtrler) applyOpToStateMachineL(op Op) {
+	var newConfig Config
+	lastConfig := sc.configs[len(sc.configs)-1]
+	newConfig = Config{
+		Num:    lastConfig.Num + 1,
+		Groups: make(map[int][]string),
+	}
+
 	switch op.Op {
 	case Join:
+		// get joinArg from Opp
+		// process Join
+		newConfig.addNewGroups(lastConfig.Groups, op.Servers)
+		newConfig.reconfigShards()
+		sc.configs = append(sc.configs, newConfig)
+		Debug(dCommit, "S%d completed JOIN , newConfig:%+v, Servers: %+v", sc.me, newConfig, op.Servers)
 
+	case Leave:
+		// get leaveArg from Opp
+		// process Leave
+		newConfig.removeGIDs(lastConfig.Groups, op.GIDs)
+		newConfig.reconfigShards()
+		sc.configs = append(sc.configs, newConfig)
+	case Move:
+		copy(newConfig.Shards[:], lastConfig.Shards[:])
+		newConfig.Shards[op.Shard] = op.GID
+		newConfig.addNewGroups(lastConfig.Groups, nil)
+		sc.configs = append(sc.configs, newConfig)
+	}
+
+}
+
+func (c *Config) addNewGroups(oldGroups map[int][]string, newGroups map[int][]string) {
+	for gid, servers := range oldGroups {
+		c.Groups[gid] = servers
+	}
+	for gid, servers := range newGroups {
+		c.Groups[gid] = servers
+	}
+}
+
+func (c *Config) removeGIDs(oldGroups map[int][]string, gids []int) {
+	gidsToRemove := make(map[int]bool)
+	for _, gid := range gids {
+		gidsToRemove[gid] = true
+	}
+
+	for gid, servers := range oldGroups {
+		if !gidsToRemove[gid] {
+			c.Groups[gid] = servers
+		}
+	}
+}
+
+func (c *Config) reconfigShards() {
+	// sort GIDs,  config Shard to GIDS[ShardNumber % len(GIDs)]
+	gids := []int{}
+	for gid := range c.Groups {
+		gids = append(gids, gid)
+	}
+
+	sort.Ints(gids)
+
+	var gidN int
+	for shardN := 0; shardN < NShards; shardN++ {
+		if len(gids) > 0 {
+			gidN = gids[shardN%len(gids)]
+		} else {
+			gidN = 0
+		}
+
+		c.Shards[shardN] = gidN
 	}
 }

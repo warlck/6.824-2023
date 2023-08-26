@@ -31,12 +31,22 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.clientID = nrand()
+	ck.requestSequenceNo = 1
 	// Your code here.
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
-	args := &QueryArgs{}
+
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := &QueryArgs{
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
 	// Your code here.
 	args.Num = num
 	for {
@@ -53,9 +63,20 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
-	args := &JoinArgs{}
+	Debug(dClient, "Clerk: %d is calling  Join  servers: %+v", ck.clientID, servers)
+
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := &JoinArgs{
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
 	// Your code here.
 	args.Servers = servers
+	Debug(dClient, "Clerk: %d is calling  Join  args: %+v", ck.clientID, args)
 
 	for {
 		// try each known server.
@@ -71,7 +92,15 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
-	args := &LeaveArgs{}
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := &LeaveArgs{
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
 	// Your code here.
 	args.GIDs = gids
 
@@ -89,7 +118,16 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &MoveArgs{}
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := &MoveArgs{
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
+
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
