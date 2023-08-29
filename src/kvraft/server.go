@@ -366,19 +366,6 @@ func (kv *KVServer) removeResponseWaiter(index int) {
 	delete(kv.opResponseWaiters, index)
 }
 
-func (kv *KVServer) initKVServer() {
-	for _, logEntry := range kv.rf.LogEntries() {
-		op, ok := logEntry.Command.(Op)
-		if ok {
-			kv.duplicateTable[op.ClientID] = OpResponse{
-				ClientID:     op.ClientID,
-				RequestSeqID: op.RequestSeqID,
-			}
-			kv.applyOpToStateMachineL(op)
-		}
-	}
-}
-
 func (kv *KVServer) snapShotKVState(index int) {
 	if kv.maxraftstate < 0 {
 		return

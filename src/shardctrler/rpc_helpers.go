@@ -15,8 +15,6 @@ func (sc *ShardCtrler) checkRepeatRequest(clientID, requestSeqID int64) (Err, bo
 	response := sc.duplicateTable[clientID]
 	sc.mu.Unlock()
 
-	// Debug(dClient, "S%d received Join | before lock, reponse: %+v, args: %+v", kv.me, response, args)
-
 	if response.RequestSeqID == requestSeqID && response.ClientID == clientID {
 		return OK, true
 	}
@@ -29,15 +27,13 @@ func (sc *ShardCtrler) checkRepeatRequest(clientID, requestSeqID int64) (Err, bo
 
 func (sc *ShardCtrler) processRaftMessage(command Op, clientID int64, requestSeqID int64, r Replier) {
 	index, term, isLeader := sc.rf.Start(command)
-	//Debug(dClient, "S%d received Get  Request | before Lock %+v, isLeader:%t, index: %d", kv.me, kv.stateMachine, isLeader, index)
+
 	if !isLeader {
 		r.ReplyWrongLeader()
+		return
 	}
 
-	// Debug(dClient, "S%d received Get  Request | before lock, args: %+v, index: %d, isLeader: %t",
-	// kv.me, args, index, isLeader)
 	sc.mu.Lock()
-	// Debug(dClient, "S%d received Get  Request | after lock", kv.me)
 
 	// We need to check if ApplyMsg receiver has  already received an apply message with current index
 	// If the apply message with current index already has been received, responseWaiter will contain a buffered channel with
