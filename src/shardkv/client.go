@@ -11,6 +11,7 @@ package shardkv
 import (
 	"crypto/rand"
 	"math/big"
+	"sync"
 	"time"
 
 	"6.824/labrpc"
@@ -41,6 +42,10 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	clientID          int64
+	requestSequenceNo int64
+	mu                sync.Mutex
 }
 
 // the tester calls MakeClerk.
@@ -54,7 +59,10 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
+
 	// You'll have to add code here.
+	ck.clientID = nrand()
+	ck.requestSequenceNo = 1
 	return ck
 }
 
@@ -63,8 +71,17 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := GetArgs{
+		Key:          key,
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
 
 	for {
 		shard := key2shard(key)
@@ -75,6 +92,10 @@ func (ck *Clerk) Get(key string) string {
 				srv := ck.make_end(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
+
+				Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply: %+v",
+					ck.clientID, si, ok, args, reply)
+
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
@@ -95,10 +116,18 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	ck.mu.Lock()
+	requestSequenceNumber := ck.requestSequenceNo
+	ck.requestSequenceNo++
+	ck.mu.Unlock()
+
+	args := PutAppendArgs{
+		Key:          key,
+		Value:        value,
+		Op:           op,
+		RequestSeqID: requestSequenceNumber,
+		ClientID:     ck.clientID,
+	}
 
 	for {
 		shard := key2shard(key)
