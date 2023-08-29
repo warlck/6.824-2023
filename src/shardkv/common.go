@@ -10,13 +10,23 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongGroup   = "ErrWrongGroup"
+	ErrWrongLeader  = "ErrWrongLeader"
+	ErrStaleRequest = "ErrStaleRequest"
+
+	Get    = "Get"
+	Put    = "Put"
+	Append = "Append"
 )
 
 type Err string
+
+type Replier interface {
+	ReplyOK()
+	ReplyWrongLeader()
+}
 
 // Put or Append
 type PutAppendArgs struct {
@@ -24,21 +34,39 @@ type PutAppendArgs struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append"
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type PutAppendReply struct {
 	Err Err
 }
 
+func (p *PutAppendReply) ReplyOK() {
+	p.Err = OK
+}
+
+func (p *PutAppendReply) ReplyWrongLeader() {
+	p.Err = ErrWrongLeader
+}
+
 type GetArgs struct {
 	Key string
-	// You'll have to add definitions here.
+
+	ClientID     int64
+	RequestSeqID int64
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+func (g *GetReply) ReplyOK() {
+	g.Err = OK
+}
+
+func (g *GetReply) ReplyWrongLeader() {
+	g.Err = ErrWrongLeader
 }
