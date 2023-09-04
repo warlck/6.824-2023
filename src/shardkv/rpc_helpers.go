@@ -91,11 +91,19 @@ func (kv *ShardKV) processRaftMessage(command Op, clientID int64, requestSeqID i
 	}
 }
 
-func (kv *ShardKV) shardIsServedByGroup(key string) bool {
+func (kv *ShardKV) keyIsServedByGroup(key string) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	shard := key2shard(key)
 	gid := kv.shardConfig.Shards[shard]
 
-	return gid == kv.gid
+	return gid == kv.gid && kv.shardIsReadyToServe[shard]
+}
+
+func (kv *ShardKV) shardIsServedByGroup(shard int) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	gid := kv.shardConfig.Shards[shard]
+
+	return gid == kv.gid && kv.shardIsReadyToServe[shard]
 }

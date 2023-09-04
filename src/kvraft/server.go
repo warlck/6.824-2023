@@ -17,6 +17,7 @@ type Op struct {
 	Key          string
 	Value        string
 	Op           string
+	ConfigNum    int
 	RequestSeqID int64
 	ClientID     int64
 }

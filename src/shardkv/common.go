@@ -15,10 +15,12 @@ const (
 	ErrWrongGroup   = "ErrWrongGroup"
 	ErrWrongLeader  = "ErrWrongLeader"
 	ErrStaleRequest = "ErrStaleRequest"
+	ErrWrongConfig  = "ErrWrongConfig"
 
 	Get    = "Get"
 	Put    = "Put"
 	Append = "Append"
+	Config = "Config"
 )
 
 type Err string
@@ -69,4 +71,14 @@ func (g *GetReply) ReplyOK() {
 
 func (g *GetReply) ReplyWrongLeader() {
 	g.Err = ErrWrongLeader
+}
+
+type GetShardArgs struct {
+	ShardID   int
+	ConfigNum int
+}
+
+type GetShardReply struct {
+	Err      Err
+	ShardKVs map[string]string
 }
