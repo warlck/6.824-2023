@@ -6,7 +6,6 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -15,10 +14,12 @@ import (
 )
 
 type Op struct {
+	Server       string
 	Key          string
 	Value        string
 	Op           string
 	ConfigNum    int
+	ShardKVs     map[string]string
 	RequestSeqID int64
 	ClientID     int64
 }
@@ -51,7 +52,7 @@ type ShardKV struct {
 
 	sm                  *shardctrler.Clerk
 	shardConfig         shardctrler.Config
-	shardIsReadyToServe map[int]bool
+	shardIsReadyToServe map[int]map[int]bool
 	appliedConfigNum    int
 
 	// Need to maintain the dead/alive state so that long living
@@ -65,13 +66,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = err
 		return
 	}
-
+	Debug(dInfo, "S%d-%d received Get  args: %+v", kv.me, kv.gid, args)
 	if !kv.keyIsServedByGroup(args.Key) {
 		reply.Err = ErrWrongGroup
 		return
 	}
 
 	command := Op{
+		Server:       fmt.Sprintf("S%d-%d", kv.me, kv.gid),
 		Op:           Get,
 		Key:          args.Key,
 		RequestSeqID: args.RequestSeqID,
@@ -92,12 +94,14 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
+	Debug(dInfo, "S%d-%d received PutAppend  args: %+v", kv.me, kv.gid, args)
 	if !kv.keyIsServedByGroup(args.Key) {
 		reply.Err = ErrWrongGroup
 		return
 	}
 
 	command := Op{
+		Server:       fmt.Sprintf("S%d-%d", kv.me, kv.gid),
 		Op:           args.Op,
 		Key:          args.Key,
 		Value:        args.Value,
@@ -125,18 +129,17 @@ func (kv *ShardKV) killed() bool {
 
 func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
 	// Before proceeding, need to ensure that that latest applied
 	// configNum is same as configNum passed is args values.
+	// If that is not the case, there might be in flight log entries that were submitted
+	// to Raft log, but have not been applied to state machine yet.
 	kv.mu.Lock()
 	appliedConfigNum := kv.appliedConfigNum
 	kv.mu.Unlock()
 
-	if appliedConfigNum != args.ConfigNum {
+	Debug(dLeader, "S%d-%d received GetShard request args:%+v, appliedConfigNum:%d", kv.me, kv.gid, args, appliedConfigNum)
+
+	if appliedConfigNum < args.ConfigNum {
 		reply.Err = ErrWrongGroup
 		return
 	}
@@ -202,6 +205,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Get the latest shard configuration before completing shardKV
 	// initialization
 	kv.sm = shardctrler.MakeClerk(kv.ctrlers)
+	kv.shardIsReadyToServe = make(map[int]map[int]bool)
 	kv.initShardConfig()
 
 	go kv.fetchLatestShardConfig()
@@ -212,36 +216,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.installStateFromSnapshot(persister.ReadSnapshot())
 	return kv
-}
-
-func (kv *ShardKV) fetchLatestShardConfig() {
-	for {
-		if kv.killed() {
-			return
-		}
-
-		// ask controler for the latest configuration.
-		kv.mu.Lock()
-		currentConfig := kv.shardConfig
-		kv.mu.Unlock()
-		newConfig := kv.sm.Query(-1)
-		if newConfig.Num > currentConfig.Num {
-			// Agree on new config with the group
-			// Use Raft
-			kv.mu.Lock()
-			kv.shardConfig = newConfig
-			kv.shardIsReadyToServe = make(map[int]bool)
-			kv.agreeOnNewConfig(newConfig)
-			kv.mu.Unlock()
-
-			// Fetch shards from previous shard owners,
-			// Get ready to serve new shards
-			kv.applyNewConfig(currentConfig, newConfig)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
 }
 
 // Processes incoming ApplyMsg values that were processed and passed from Raft.
@@ -258,8 +232,15 @@ func (kv *ShardKV) receiveApplyMessages() {
 		if applyMsg.CommandValid {
 			op, ok := applyMsg.Command.(Op)
 			if ok {
+				Debug(dCommit, "S%d-%d received message: %+v, before duplicate check", kv.me, kv.gid, applyMsg)
 				if op.Op == Config {
 					kv.applyConfigNumL(op.ConfigNum)
+					kv.mu.Unlock()
+					continue
+				}
+
+				if op.Op == ShardData {
+					kv.applyShardDataL(op)
 					kv.mu.Unlock()
 					continue
 				}
@@ -271,7 +252,7 @@ func (kv *ShardKV) receiveApplyMessages() {
 					Index:        applyMsg.CommandIndex,
 				}
 
-				Debug(dCommit, "S%d received message: %+v, response: %+v ", kv.me, applyMsg, dupTableEntry)
+				Debug(dCommit, "S%d-%d received message: %+v, response: %+v ", kv.me, kv.gid, applyMsg, dupTableEntry)
 				if op.RequestSeqID > dupTableEntry.RequestSeqID {
 					kv.duplicateTable[op.ClientID] = response
 					kv.applyOpToStateMachineL(op)
@@ -360,80 +341,13 @@ func (kv *ShardKV) installStateFromSnapshot(data []byte) {
 	kv.duplicateTable = duplicateTable
 }
 
-func (kv *ShardKV) agreeOnNewConfig(newConfig shardctrler.Config) {
-	op := Op{
-		Op:        Config,
-		ConfigNum: newConfig.Num,
-	}
-
-	// Fire and forget the Raft aggrement for the latest config.
-	// The agreement is required to ensure that there will be
-	// no more in flight operations  belonging to older config shards
-	// that group  needs to serve, before current group can correctly
-	// reply to GetShard RPC
-	kv.rf.Start(op)
-}
-
-// Changed applied configNum state to passed configNum value
-// This state is required for correct operation of GetShard RPC
-func (kv *ShardKV) applyConfigNumL(configNum int) {
-	kv.appliedConfigNum = configNum
-}
-
-func (kv *ShardKV) applyNewConfig(currentConfig, newConfig shardctrler.Config) {
-	shardsToServe := []int{}
-	for i := range newConfig.Shards {
-		if newConfig.Shards[i] == kv.gid {
-			shardsToServe = append(shardsToServe, i)
-		}
-	}
-
-	for _, shard := range shardsToServe {
-		currentShardGID := currentConfig.Shards[shard]
-		go func(gid, shard int) {
-			shardKVs := kv.getShardKVs(gid, shard, currentConfig, newConfig)
-			kv.mu.Lock()
-			for key, value := range shardKVs {
-				kv.stateMachine[key] = value
-			}
-			kv.shardIsReadyToServe[shard] = true
-			kv.mu.Unlock()
-		}(currentShardGID, shard)
-	}
-
-}
-
-func (kv *ShardKV) getShardKVs(gid, shard int, currentConfig, newConfig shardctrler.Config) map[string]string {
-	args := GetShardArgs{
-		ShardID:   shard,
-		ConfigNum: newConfig.Num,
-	}
-
-	for {
-		if servers, ok := currentConfig.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := kv.make_end(servers[si])
-				var reply GetShardReply
-				ok := srv.Call("ShardKV.GetShard", &args, &reply)
-
-				if ok && (reply.Err == OK) {
-					return reply.ShardKVs
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
 func (kv *ShardKV) initShardConfig() {
 	kv.shardConfig = kv.sm.Query(-1)
-	kv.shardIsReadyToServe = make(map[int]bool)
+	configNum := kv.shardConfig.Num
+	kv.appliedConfigNum = configNum
+	kv.shardIsReadyToServe[configNum] = make(map[int]bool)
 	for i := 0; i < shardctrler.NShards; i++ {
-		kv.shardIsReadyToServe[i] = true
+		kv.shardIsReadyToServe[configNum][i] = true
 	}
+
 }

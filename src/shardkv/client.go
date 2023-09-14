@@ -82,7 +82,8 @@ func (ck *Clerk) Get(key string) string {
 		RequestSeqID: requestSequenceNumber,
 		ClientID:     ck.clientID,
 	}
-
+	Debug(dClient, "Clerk: %d is preparing a  Get with args: %+v",
+		ck.clientID, args)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -93,8 +94,8 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 
-				Debug(dClient, "Clerk: %d has received reply  for  Get from  server: %d, OK: %t,  args: %+v,  reply: %+v",
-					ck.clientID, si, ok, args, reply)
+				Debug(dClient, "Clerk: %d has received reply  for  Get from  S%d-%d, OK: %t,  args: %+v,  reply: %+v",
+					ck.clientID, si, gid, ok, args, reply)
 
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
@@ -129,6 +130,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ClientID:     ck.clientID,
 	}
 
+	Debug(dClient, "Clerk: %d is preparing a  PutAppend with args: %+v",
+		ck.clientID, args)
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
@@ -137,6 +140,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
+				Debug(dClient, "Clerk: %d has received reply  for  PutAppend from  S%d-%d, OK: %t,  args: %+v,  reply: %+v",
+					ck.clientID, si, gid, ok, args, reply)
 				if ok && reply.Err == OK {
 					return
 				}

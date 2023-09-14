@@ -65,6 +65,7 @@ func (kv *ShardKV) processRaftMessage(command Op, clientID int64, requestSeqID i
 				}
 			}(timer)
 
+			Debug(dLeader, "S%d-%d Raft message handler | after received opResponse: %+v, index: %d, requestSeqID: %d, clientID: %d", kv.me, kv.gid, opResponse, index, requestSeqID, clientID)
 			// If the command that Raft applied, matches the command that this RPC handlder has submitted
 			// (i.e RequestID and index matches)
 			// the request has been sucessfully commited to stateMachine.
@@ -79,7 +80,7 @@ func (kv *ShardKV) processRaftMessage(command Op, clientID int64, requestSeqID i
 			}
 		case <-timer.C:
 			// Timer has fired and no message is received for the expected index in apply channel
-			// Either SC server is partitioned, or Raft term has changed
+			// Either kv server is partitioned, or Raft term has changed
 			// Do nothing if term has not changed
 			// If Raft term has progressed, reply error to the RPC request
 			newTerm, _ := kv.rf.GetState()
@@ -94,16 +95,10 @@ func (kv *ShardKV) processRaftMessage(command Op, clientID int64, requestSeqID i
 func (kv *ShardKV) keyIsServedByGroup(key string) bool {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
 	shard := key2shard(key)
 	gid := kv.shardConfig.Shards[shard]
-
-	return gid == kv.gid && kv.shardIsReadyToServe[shard]
-}
-
-func (kv *ShardKV) shardIsServedByGroup(shard int) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	gid := kv.shardConfig.Shards[shard]
-
-	return gid == kv.gid && kv.shardIsReadyToServe[shard]
+	configNum := kv.shardConfig.Num
+	Debug(dInfo, "S%d-%d received RPC request , checking if keyIsServedByGroup,  kv.gid: %+v, shard: %d, kv.shardConfig: %+v, kv.shardIsReadyToServe[shard]: %+v", kv.me, kv.gid, kv.gid, shard, kv.shardConfig, kv.shardIsReadyToServe[configNum][shard])
+	return gid == kv.gid && kv.shardIsReadyToServe[configNum][shard]
 }

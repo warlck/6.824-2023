@@ -17,10 +17,11 @@ const (
 	ErrStaleRequest = "ErrStaleRequest"
 	ErrWrongConfig  = "ErrWrongConfig"
 
-	Get    = "Get"
-	Put    = "Put"
-	Append = "Append"
-	Config = "Config"
+	Get       = "Get"
+	Put       = "Put"
+	Append    = "Append"
+	Config    = "Config"
+	ShardData = "ShardData"
 )
 
 type Err string
@@ -74,6 +75,7 @@ func (g *GetReply) ReplyWrongLeader() {
 }
 
 type GetShardArgs struct {
+	Server    string
 	ShardID   int
 	ConfigNum int
 }
