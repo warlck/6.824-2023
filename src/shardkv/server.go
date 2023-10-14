@@ -50,10 +50,11 @@ type ShardKV struct {
 	// sent by Clerk
 	duplicateTable map[int64]OpResponse
 
-	sm                  *shardctrler.Clerk
-	shardConfig         shardctrler.Config
-	shardIsReadyToServe map[int]map[int]bool
-	appliedConfigNum    int
+	sm *shardctrler.Clerk
+	// ShardConfigState, shotened to `scs` contains all the necessary data
+	// for managing the shard config state transitions, and data on availability
+	// on current server
+	scs shardConfigState
 
 	// Need to maintain the dead/alive state so that long living
 	// goroutines and channels can be cleared
@@ -62,8 +63,12 @@ type ShardKV struct {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	err, ret := kv.checkRepeatRequest(args.ClientID, args.RequestSeqID)
+
 	if ret {
 		reply.Err = err
+		if reply.Err == OK {
+			reply.Value = kv.stateMachine[args.Key]
+		}
 		return
 	}
 	Debug(dInfo, "S%d-%d received Get  args: %+v", kv.me, kv.gid, args)
@@ -83,7 +88,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.processRaftMessage(command, args.ClientID, args.RequestSeqID, reply)
 
 	kv.mu.Lock()
-	reply.Value = kv.stateMachine[args.Key]
+	if reply.Err == OK {
+		reply.Value = kv.stateMachine[args.Key]
+	}
 	kv.mu.Unlock()
 }
 
@@ -129,17 +136,18 @@ func (kv *ShardKV) killed() bool {
 
 func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 
-	// Before proceeding, need to ensure that that latest applied
+	// Before proceeding, need to ensure that that latest logged
 	// configNum is same as configNum passed is args values.
-	// If that is not the case, there might be in flight log entries that were submitted
+	// If that is not the case, there might be in flight log entries
+	// corresponding to shards from older configs that were submitted
 	// to Raft log, but have not been applied to state machine yet.
 	kv.mu.Lock()
-	appliedConfigNum := kv.appliedConfigNum
+	loggedConfigNum := kv.scs.loggedConfigNum
 	kv.mu.Unlock()
 
-	Debug(dLeader, "S%d-%d received GetShard request args:%+v, appliedConfigNum:%d", kv.me, kv.gid, args, appliedConfigNum)
+	Debug(dLeader, "S%d-%d received GetShard request args:%+v, appliedConfigNum:%d", kv.me, kv.gid, args, loggedConfigNum)
 
-	if appliedConfigNum < args.ConfigNum {
+	if loggedConfigNum < args.ConfigNum {
 		reply.Err = ErrWrongGroup
 		return
 	}
@@ -155,7 +163,6 @@ func (kv *ShardKV) GetShard(args *GetShardArgs, reply *GetShardReply) {
 
 	reply.Err = OK
 	reply.ShardKVs = shardKVs
-
 }
 
 // servers[] contains the ports of the servers in this group.
@@ -205,7 +212,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Get the latest shard configuration before completing shardKV
 	// initialization
 	kv.sm = shardctrler.MakeClerk(kv.ctrlers)
-	kv.shardIsReadyToServe = make(map[int]map[int]bool)
+	kv.scs = shardConfigState{
+		shardIsReadyToServe: make(map[int]map[int]bool),
+		loggedConfigNum:     -1,
+	}
+
+	kv.installStateFromSnapshot(persister.ReadSnapshot())
+
 	kv.initShardConfig()
 
 	go kv.fetchLatestShardConfig()
@@ -214,7 +227,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.receiveApplyMessages()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.installStateFromSnapshot(persister.ReadSnapshot())
+	Debug(dLog, "S%d-%d has started ############### ", kv.me, kv.gid)
 	return kv
 }
 
@@ -226,7 +239,6 @@ func (kv *ShardKV) receiveApplyMessages() {
 		if kv.killed() {
 			return
 		}
-
 		applyMsg := <-kv.applyCh
 		kv.mu.Lock()
 		if applyMsg.CommandValid {
@@ -314,6 +326,7 @@ func (kv *ShardKV) snapshotData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.stateMachine)
 	e.Encode(kv.duplicateTable)
+	e.Encode(kv.scs.loggedConfigNum)
 	return w.Bytes()
 }
 
@@ -327,27 +340,26 @@ func (kv *ShardKV) installStateFromSnapshot(data []byte) {
 
 	var stateMachine map[string]string
 	var duplicateTable map[int64]OpResponse
+	var loggedConfigNum int
 	var err error
 
 	if err := d.Decode(&stateMachine); err != nil {
-		log.Fatal("Failed to read log from persistent state", err)
+		log.Fatal("Failed to read statemachine from snapshot", err)
 	}
 
 	if err = d.Decode(&duplicateTable); err != nil {
-		log.Fatal("Failed to read votedFor from persistent state", err)
+		log.Fatal("Failed to read duplicateTable from snapshot", err)
+	}
+
+	if err = d.Decode(&loggedConfigNum); err != nil {
+		log.Fatal("Failed to read loggedConfigNum from  snapshot", err)
 	}
 
 	kv.stateMachine = stateMachine
 	kv.duplicateTable = duplicateTable
+	kv.scs.loggedConfigNum = loggedConfigNum
 }
 
 func (kv *ShardKV) initShardConfig() {
-	kv.shardConfig = kv.sm.Query(-1)
-	configNum := kv.shardConfig.Num
-	kv.appliedConfigNum = configNum
-	kv.shardIsReadyToServe[configNum] = make(map[int]bool)
-	for i := 0; i < shardctrler.NShards; i++ {
-		kv.shardIsReadyToServe[configNum][i] = true
-	}
-
+	kv.installShardConfig(kv.scs.loggedConfigNum)
 }

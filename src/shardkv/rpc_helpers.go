@@ -97,8 +97,8 @@ func (kv *ShardKV) keyIsServedByGroup(key string) bool {
 	defer kv.mu.Unlock()
 
 	shard := key2shard(key)
-	gid := kv.shardConfig.Shards[shard]
-	configNum := kv.shardConfig.Num
-	Debug(dInfo, "S%d-%d received RPC request , checking if keyIsServedByGroup,  kv.gid: %+v, shard: %d, kv.shardConfig: %+v, kv.shardIsReadyToServe[shard]: %+v", kv.me, kv.gid, kv.gid, shard, kv.shardConfig, kv.shardIsReadyToServe[configNum][shard])
-	return gid == kv.gid && kv.shardIsReadyToServe[configNum][shard]
+	gid := kv.scs.currentConfig.Shards[shard]
+	configNum := kv.scs.currentConfig.Num
+	Debug(dInfo, "S%d-%d received RPC request , checking if keyIsServedByGroup, key:%s,   kv.gid: %+v, gid:%d,  shard: %d, kv.shardConfig: %+v, kv.shardIsReadyToServe[shard]: %+v", kv.me, kv.gid, key, kv.gid, gid, shard, kv.scs.currentConfig, kv.scs.shardIsReadyToServe[configNum][shard])
+	return gid == kv.gid && kv.scs.shardIsReadyToServe[configNum][shard]
 }

@@ -41,7 +41,6 @@ type Clerk struct {
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
 
 	clientID          int64
 	requestSequenceNo int64
@@ -60,7 +59,6 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 
-	// You'll have to add code here.
 	ck.clientID = nrand()
 	ck.requestSequenceNo = 1
 	return ck
@@ -84,8 +82,9 @@ func (ck *Clerk) Get(key string) string {
 	}
 	Debug(dClient, "Clerk: %d is preparing a  Get with args: %+v",
 		ck.clientID, args)
+
+	shard := key2shard(key)
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -132,8 +131,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	Debug(dClient, "Clerk: %d is preparing a  PutAppend with args: %+v",
 		ck.clientID, args)
+
+	shard := key2shard(key)
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {

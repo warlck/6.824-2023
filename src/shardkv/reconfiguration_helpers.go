@@ -7,6 +7,12 @@ import (
 	"6.824/shardctrler"
 )
 
+type shardConfigState struct {
+	loggedConfigNum     int
+	currentConfig       shardctrler.Config
+	shardIsReadyToServe map[int]map[int]bool
+}
+
 func (kv *ShardKV) fetchLatestShardConfig() {
 	for {
 		if kv.killed() {
@@ -15,34 +21,22 @@ func (kv *ShardKV) fetchLatestShardConfig() {
 
 		// ask controler for the latest configuration.
 		kv.mu.Lock()
-		currentConfig := kv.shardConfig
+		currentConfig := kv.scs.currentConfig
 		kv.mu.Unlock()
 
 		newConfig := kv.sm.Query(-1)
 		// Debug(dLog, "S%d-%d pulled latest config currentConfig: %#v, newConfig: %#v ", kv.me, kv.gid, currentConfig, newConfig)
 		if newConfig.Num > currentConfig.Num {
 			Debug(dLog, "S%d-%d pulled latest config currentConfig: %#v, newConfig: %#v ", kv.me, kv.gid, currentConfig, newConfig)
-			// Agree on new config with the group
-			// Use Raft
-			kv.mu.Lock()
-			kv.shardConfig = newConfig
-			kv.shardIsReadyToServe[newConfig.Num] = make(map[int]bool)
-
-			for shard := 0; shard < shardctrler.NShards; shard++ {
-				// New config does not require shard movement for 'shard' value
-				if (currentConfig.Shards[shard] == kv.gid || currentConfig.Shards[shard] == 0) && newConfig.Shards[shard] == kv.gid {
-					kv.shardIsReadyToServe[newConfig.Num][shard] = true
-				}
-			}
-
-			kv.mu.Unlock()
-
+			// Agree on new config with the group using Raft consensus
 			// Need to ensure this line eventually runs by Raft leader,
 			// since it may happen that leadership is currently lost by KV server
 			kv.agreeOnNewConfigNum(newConfig)
-			// Fetch shards from previous shard owners,
-			// Get ready to serve new shards
-			kv.applyNewConfig(currentConfig, newConfig)
+
+			kv.mu.Lock()
+			kv.installShardConfig(newConfig.Num)
+			kv.mu.Unlock()
+
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -50,23 +44,31 @@ func (kv *ShardKV) fetchLatestShardConfig() {
 
 }
 
-// Changed applied configNum state to passed configNum value
+// Install the ShardConfig state corresponding to  passed configNum value
 // This state is required for correct operation of GetShard RPC
 func (kv *ShardKV) applyConfigNumL(configNum int) {
-	kv.appliedConfigNum = configNum
+	if configNum > kv.scs.loggedConfigNum {
+		kv.scs.loggedConfigNum = configNum
+	}
+	if configNum > kv.scs.currentConfig.Num {
+		kv.installShardConfig(configNum)
+	}
 }
 
 func (kv *ShardKV) applyShardDataL(op Op) {
-	Debug(dCommit, "S%d-%d received ShardData message, appliedConfig: %#v, opConfigNum: %d, before duplicate check", kv.me, kv.gid, kv.shardConfig, op.ConfigNum)
+	Debug(dCommit, "S%d-%d received ShardData message, appliedConfig: %#v, opConfigNum: %d, before duplicate check", kv.me, kv.gid, kv.scs.currentConfig, op.ConfigNum)
 	shardKVs := op.ShardKVs
 	configNum := op.ConfigNum
 	var shard int
 	for key, value := range shardKVs {
 		kv.stateMachine[key] = value
+
+		// This is will keep resetting the shard value
+		// but since the operation is not expensive, we keep it here for clarity
 		shard = key2shard(key)
 	}
 
-	kv.shardIsReadyToServe[configNum][shard] = true
+	kv.scs.shardIsReadyToServe[configNum][shard] = true
 }
 
 func (kv *ShardKV) getShardKVs(gid, shard int, currentConfig, newConfig shardctrler.Config) map[string]string {
@@ -85,6 +87,7 @@ func (kv *ShardKV) getShardKVs(gid, shard int, currentConfig, newConfig shardctr
 				var reply GetShardReply
 				ok := srv.Call("ShardKV.GetShard", &args, &reply)
 				if ok && (reply.Err == OK) {
+					Debug(dInfo, "S%d-%d successfully completed GetShard request  for shard:%d  args:%+v, server: %#v", kv.me, kv.gid, shard, args, servers[si])
 					return reply.ShardKVs
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -97,8 +100,10 @@ func (kv *ShardKV) getShardKVs(gid, shard int, currentConfig, newConfig shardctr
 	}
 }
 
+// Fetches the shards data required to serve the latest shardconfig from the previous
+// shard owner group and starts the Raft agreement of the new shard data to ensure that
+// KV statemachine changes are captured in the Raft log.
 func (kv *ShardKV) applyNewConfig(currentConfig, newConfig shardctrler.Config) {
-
 	shardsToServe := []int{}
 	for i := range newConfig.Shards {
 		if newConfig.Shards[i] == kv.gid {
@@ -106,10 +111,22 @@ func (kv *ShardKV) applyNewConfig(currentConfig, newConfig shardctrler.Config) {
 		}
 	}
 
-	Debug(dInfo, "S%d-%d applying new config. new shardsToServe:%+v", kv.me, kv.gid, shardsToServe)
+	Debug(dInfo, "S%d-%d applying new config. newShardsToServe:%+v", kv.me, kv.gid, shardsToServe)
 	for _, shard := range shardsToServe {
-		go kv.fetchAndApplyShardKVs(shard, currentConfig, newConfig)
+		go func(shard int) {
+			gid := currentConfig.Shards[shard]
+			// already have the necessary shard data
+			if gid == kv.gid {
+				return
+			}
 
+			shardKVs := kv.getShardKVs(gid, shard, currentConfig, newConfig)
+			if len(shardKVs) == 0 {
+				return
+			}
+
+			kv.agreeOnShardKVs(shard, shardKVs, currentConfig, newConfig)
+		}(shard)
 	}
 
 }
@@ -124,10 +141,10 @@ func (kv *ShardKV) agreeOnNewConfigNum(newConfig shardctrler.Config) {
 	go func() {
 		for {
 			kv.mu.Lock()
-			appliedConfigNum := kv.appliedConfigNum
+			loggedConfigNum := kv.scs.loggedConfigNum
 			kv.mu.Unlock()
 
-			if appliedConfigNum >= newConfig.Num {
+			if loggedConfigNum >= newConfig.Num {
 				return
 			}
 
@@ -146,17 +163,7 @@ func (kv *ShardKV) agreeOnNewConfigNum(newConfig shardctrler.Config) {
 
 }
 
-func (kv *ShardKV) fetchAndApplyShardKVs(shard int, currentConfig, newConfig shardctrler.Config) {
-	gid := currentConfig.Shards[shard]
-	// already have the necessary shard data
-	if gid == kv.gid {
-		return
-	}
-
-	shardKVs := kv.getShardKVs(gid, shard, currentConfig, newConfig)
-	if len(shardKVs) == 0 {
-		return
-	}
+func (kv *ShardKV) agreeOnShardKVs(shard int, shardKVs map[string]string, currentConfig, newConfig shardctrler.Config) {
 
 	op := Op{
 		Server:    fmt.Sprintf("S%d-%d", kv.me, kv.gid),
@@ -167,7 +174,7 @@ func (kv *ShardKV) fetchAndApplyShardKVs(shard int, currentConfig, newConfig sha
 
 	for {
 		kv.mu.Lock()
-		shardIsReadyToServe := kv.shardIsReadyToServe[newConfig.Num][shard]
+		shardIsReadyToServe := kv.scs.shardIsReadyToServe[newConfig.Num][shard]
 		kv.mu.Unlock()
 
 		// When shard data has been successfully shared mong replica group,
@@ -184,4 +191,23 @@ func (kv *ShardKV) fetchAndApplyShardKVs(shard int, currentConfig, newConfig sha
 		time.Sleep(100 * time.Millisecond)
 	}
 
+}
+
+func (kv *ShardKV) installShardConfig(configNum int) {
+	oldConfig := kv.scs.currentConfig
+	newConfig := kv.sm.Query(configNum)
+	newConfigNum := newConfig.Num
+	kv.scs.currentConfig = newConfig
+
+	kv.scs.shardIsReadyToServe[newConfigNum] = make(map[int]bool)
+	for shard := 0; shard < shardctrler.NShards; shard++ {
+		// New config does not require shard movement for 'shard' value
+		if (oldConfig.Shards[shard] == kv.gid || oldConfig.Shards[shard] == 0) && newConfig.Shards[shard] == kv.gid {
+			kv.scs.shardIsReadyToServe[newConfigNum][shard] = true
+		}
+	}
+	Debug(dInfo, "S%d-%d is installing shard config:%d, oldConfig:%+v, newConfig:%+v, shardsReadyToServe:%+v", kv.me, kv.gid, configNum, oldConfig, newConfig, kv.scs.shardIsReadyToServe[newConfigNum])
+	// Fetch shards from previous shard owners,
+	// Get ready to serve new shards
+	go kv.applyNewConfig(oldConfig, newConfig)
 }
