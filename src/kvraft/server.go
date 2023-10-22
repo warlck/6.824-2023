@@ -17,7 +17,6 @@ type Op struct {
 	Key          string
 	Value        string
 	Op           string
-	ConfigNum    int
 	RequestSeqID int64
 	ClientID     int64
 }
@@ -288,7 +287,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.duplicateTable = make(map[int64]OpResponse)
 
 	kv.installStateFromSnapshot(persister.ReadSnapshot())
-
 	return kv
 }
 

@@ -18,7 +18,8 @@ type Op struct {
 	Key          string
 	Value        string
 	Op           string
-	ConfigNum    int
+	Config       shardctrler.Config
+	ShardID      int
 	ShardKVs     map[string]string
 	RequestSeqID int64
 	ClientID     int64
@@ -195,6 +196,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(shardctrler.Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -214,20 +216,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.sm = shardctrler.MakeClerk(kv.ctrlers)
 	kv.scs = shardConfigState{
 		shardIsReadyToServe: make(map[int]map[int]bool),
-		loggedConfigNum:     -1,
 	}
 
 	kv.installStateFromSnapshot(persister.ReadSnapshot())
-
 	kv.initShardConfig()
-
-	go kv.fetchLatestShardConfig()
+	go kv.fetchAndInstallShardConfig()
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	go kv.receiveApplyMessages()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	Debug(dLog, "S%d-%d has started ############### ", kv.me, kv.gid)
+
 	return kv
 }
 
@@ -246,13 +246,15 @@ func (kv *ShardKV) receiveApplyMessages() {
 			if ok {
 				Debug(dCommit, "S%d-%d received message: %+v, before duplicate check", kv.me, kv.gid, applyMsg)
 				if op.Op == Config {
-					kv.applyConfigNumL(op.ConfigNum)
+					kv.processConfigOp(op.Config)
+					kv.snapShotKVState(applyMsg.CommandIndex)
 					kv.mu.Unlock()
 					continue
 				}
 
 				if op.Op == ShardData {
-					kv.applyShardDataL(op)
+					kv.processShardDataOp(op)
+					kv.snapShotKVState(applyMsg.CommandIndex)
 					kv.mu.Unlock()
 					continue
 				}
@@ -326,7 +328,8 @@ func (kv *ShardKV) snapshotData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.stateMachine)
 	e.Encode(kv.duplicateTable)
-	e.Encode(kv.scs.loggedConfigNum)
+	e.Encode(kv.scs.currentConfig)
+	e.Encode(kv.scs.shardIsReadyToServe)
 	return w.Bytes()
 }
 
@@ -340,7 +343,8 @@ func (kv *ShardKV) installStateFromSnapshot(data []byte) {
 
 	var stateMachine map[string]string
 	var duplicateTable map[int64]OpResponse
-	var loggedConfigNum int
+	var currentConfig shardctrler.Config
+	var shardIsReadyToServe map[int]map[int]bool
 	var err error
 
 	if err := d.Decode(&stateMachine); err != nil {
@@ -351,15 +355,16 @@ func (kv *ShardKV) installStateFromSnapshot(data []byte) {
 		log.Fatal("Failed to read duplicateTable from snapshot", err)
 	}
 
-	if err = d.Decode(&loggedConfigNum); err != nil {
+	if err = d.Decode(&currentConfig); err != nil {
 		log.Fatal("Failed to read loggedConfigNum from  snapshot", err)
+	}
+
+	if err = d.Decode(&shardIsReadyToServe); err != nil {
+		log.Fatal("Failed to read shardIsReadyToServe from  snapshot", err)
 	}
 
 	kv.stateMachine = stateMachine
 	kv.duplicateTable = duplicateTable
-	kv.scs.loggedConfigNum = loggedConfigNum
-}
-
-func (kv *ShardKV) initShardConfig() {
-	kv.installShardConfig(kv.scs.loggedConfigNum)
+	kv.scs.currentConfig = currentConfig
+	kv.scs.shardIsReadyToServe = shardIsReadyToServe
 }
